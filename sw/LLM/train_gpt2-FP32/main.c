@@ -102,111 +102,6 @@ void fast_exp(float* inp, float* out, int memload, int vnum, int lmul, int size,
     }
 }
 
-// ======================= constants =======================
-static inline void sincos_consts(float *INVPIO2, float *PIO2_HI, float *PIO2_LO,
-                                float *S1, float *S3, float *S5, float *S7,
-                                float *C2, float *C4, float *C6)
-{
-    *INVPIO2 = 0.6366197723675814f;       // 2/pi
-    *PIO2_HI = 1.5707962512969971f;       // Cody–Waite split (hi)
-    *PIO2_LO = 7.5497894158615964e-08f;   // split (lo)
-    *S1 = 1.0f;
-    *S3 = -0.1666666716337204f;
-    *S5 =  0.008333333767950535f;
-    *S7 = -0.0001984126984126984f;
-    *C2 = -0.5f;
-    *C4 =  0.0416666679084301f;
-    *C6 = -0.0013888889225196834f;
-}
-
-// 32 regs, LMUL=8, SEW=32
-static inline void fast_sincos_poly_f32_m8(
-    float* inp, float* outs, float* outc,
-    int memload, int vnum, int lmul, int size, unsigned int vl)
-{
-    float INVPIO2, PIO2_HI, PIO2_LO, S1, S3, S5, S7, C2, C4, C6;
-    sincos_consts(&INVPIO2, &PIO2_HI, &PIO2_LO, &S1, &S3, &S5, &S7, &C2, &C4, &C6);
-
-    // SEW=32, LMUL=8
-    asm volatile("vsetvli %0, %1, e32, m8, ta, ma" : "=r"(vl) : "r"(size));
-
-    // ---- load x -> v24 ----
-    if (memload) {
-        asm volatile("vle32.v v24, (%0)" :: "r"(inp));
-    } else {
-        if (vnum == 0) asm volatile("vmv.v.v v24, v0"); // take from v0, then free v0
-    }
-
-    // ---- range reduction ----
-    // y = x * 2/pi   (v8)
-    asm volatile("vfmul.vf v8, v24, %[A]" :: [A] "f"(INVPIO2));
-    // k = trunc(y)   (v0 as int)
-    asm volatile("vfcvt.rtz.x.f.v v0, v8");
-    // kf = float(k)  (v8)
-    asm volatile("vfcvt.f.x.v  v8, v0");
-    // r = x - kf*PIO2_HI - kf*PIO2_LO   (v24)
-    asm volatile("vfnmsac.vf v24, %[HI], v8" :: [HI] "f"(PIO2_HI)); // v24 -= kf*PIO2_HI
-    asm volatile("vfnmsac.vf v24, %[LO], v8" :: [LO] "f"(PIO2_LO)); // v24 -= kf*PIO2_LO
-
-    // z = r^2  (v8)
-    asm volatile("vfmul.vv v8, v24, v24");
-
-    // ---- sin poly: s = r*(S1 + z*(S3 + z*(S5 + z*S7)))  (v16) ----
-    asm volatile("vfmv.v.f  v16, %[S7]" :: [S7] "f"(S7));       // acc = S7
-    asm volatile("vfmv.v.f  v0,  %[S5]" :: [S5] "f"(S5));       // coeff -> v0 (temp vector)
-    asm volatile("vfmadd.vv v16, v8, v0");                 // acc = acc*z + S5
-    asm volatile("vfmv.v.f  v0,  %[S3]" :: [S3] "f"(S3));
-    asm volatile("vfmadd.vv v16, v8, v0");                 // + S3
-    asm volatile("vfmv.v.f  v0,  %[S1]" :: [S1] "f"(S1));
-    asm volatile("vfmadd.vv v16, v8, v0");                 // + S1
-    asm volatile("vfmul.vv  v16, v16, v24");                    // s = r*poly
-
-    // ---- cos poly: c = 1 + z*(C2 + z*(C4 + z*C6))  (v24) ----
-    asm volatile("vfmv.v.f  v24, %[C6]" :: [C6] "f"(C6));       // acc = C6
-    asm volatile("vfmv.v.f  v0,  %[C4]" :: [C4] "f"(C4));
-    asm volatile("vfmadd.vv v24, v8, v0");                 // acc = acc*z + C4
-    asm volatile("vfmv.v.f  v0,  %[C2]" :: [C2] "f"(C2));
-    asm volatile("vfmadd.vv v24,  v8, v0");                 // + C2
-    asm volatile("vfadd.vf  v24, v24, %[ONE]" :: [ONE] "f"(1.0f)); // + 1
-
-    // ---- quadrant swap (odd quadrants swap s<->c) ----
-    // Rebuild q = (int)(x*2/pi) & 3   (we reload x; cheap and avoids keeping k live)
-    asm volatile("vle32.v v8, (%0)" :: "r"(inp));
-    asm volatile("vfmul.vf v8, v8, %[A]" :: [A] "f"(INVPIO2));
-    asm volatile("vfcvt.rtz.x.f.v v0, v8");               // k
-    asm volatile("vand.vi   v0, v0, 3");                  // q
-    // m_odd = (q & 1) != 0  -> v0 (mask)
-    asm volatile("vmv.v.v   v8, v0");                     // copy q -> v8 (int)
-    asm volatile("vand.vi   v8, v8, 1");
-    asm volatile("vmseq.vi  v0, v8, 1");                  // v0 = odd?
-    // cos_out -> v8, sin_out stays in v16
-    asm volatile("vmerge.vvm v8,  v16, v24, v0.t");         // v8 = odd ? s : c
-    asm volatile("vmerge.vvm v16, v24, v16, v0.t");         // v16 = odd ? c : s
-    asm volatile("vmv.v.v   v24, v8");                    // move cos_out to v24
-
-    // ---- apply signs ----
-    // Rebuild q once (int) into v8
-    asm volatile("vle32.v v8, (%0)" :: "r"(inp));
-    asm volatile("vfmul.vf v8, v8, %[A]" :: [A] "f"(INVPIO2));
-    asm volatile("vfcvt.rtz.x.f.v v8, v8");               // k
-    asm volatile("vand.vi   v8, v8, 3");                  // q in v8 (int)
-
-    // sin sign: negate where (q & 2) != 0  => q in {2,3}
-    asm volatile("vmv.v.v   v0, v8");                     // temp
-    asm volatile("vand.vi   v0, v0, 2");
-    asm volatile("vmseq.vi  v0, v0, 2");                  // mask for bit1==1
-    asm volatile("vfneg.v   v16, v16, v0");             // masked negate
-
-    // cos sign: negate where q==1 or q==2
-    asm volatile("vmseq.vi  v0, v8, 1");
-    asm volatile("vfneg.v   v24, v24, v0");
-    asm volatile("vmseq.vi  v0, v8, 2");
-    asm volatile("vfneg.v   v24, v24, v0");
-
-    // ---- store ----
-    asm volatile("vse32.v v16, (%0)" :: "r"(outs));       // sin
-    asm volatile("vse32.v v24, (%0)" :: "r"(outc));       // cos
-}
 
 
 
@@ -2407,7 +2302,7 @@ int main() {
     snrt_cluster_hw_barrier();
     start_kernel();    
     for (int i = 0; i < ((B*T*C)/VLMAX); i++){
-        fast_sincos_poly_f32_m8(inp+i*VLMAX, out+i*VLMAX, out_s + i*VLMAX, 1,0,8, VLMAX, vl);
+        fast_exp(inp+i*VLMAX, out+i*VLMAX, out_s + i*VLMAX, 1,0,8, VLMAX, vl);
     }
     stop_kernel();
     if(cid == 0){
