@@ -45,5 +45,11 @@ enable_testing()
 set(SNITCH_TEST_PREFIX non-linear-)
 
 #WUS
-add_snitch_test(sin_cos /usr/scratch2/pisoc1/msc25h16/spatz/sw/non-linearities/FP32/sin_cos.c)
-#add_snitch_test(train_gpt2-FP16 train_gpt2-FP16/main.c)
+add_snitch_test(sin_cos /usr/scratch2/pisoc1/msc25h16/spatz/sw/non-linearities/FP32/sin_cos/sin_cos.c)
+add_snitch_test(logf /usr/scratch2/pisoc1/msc25h16/spatz/sw/non-linearities/FP32/logf/logf.c)
+add_snitch_test(rsqrt /usr/scratch2/pisoc1/msc25h16/spatz/sw/non-linearities/FP32/rsqrt/rsqrt.c)
+add_snitch_test(tanh /usr/scratch2/pisoc1/msc25h16/spatz/sw/non-linearities/FP32/tanh/tanh.c)
+#add_snitch_test(cosh /usr/scratch2/pisoc1/msc25h16/spatz/sw/non-linearities/FP32/cosh/cosh.c)
+#add_snitch_test(exp /usr/scratch2/pisoc1/msc25h16/spatz/sw/non-linearities/FP32/exp/exp.c)
+
+
