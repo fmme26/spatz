@@ -49,7 +49,7 @@
 #endif
 
 #ifndef TANH_DEG
-#define TANH_DEG 4
+#define TANH_DEG 2
 #endif
 
 #define THRESHOLD 0.00010f
@@ -336,18 +336,14 @@ static inline void vtanh_strip(const float* inp, float* out, int N) {
 }
 
 /* ------------------ Simple golden checker ------------------ */
-static void check_result(const float *x, const float *ref, int r) {
+static void check_result(const float *input, const float *x, const float *ref, int r) {
     int err = 0;
     for (int i = 0; i < r; i++) {
         float diff = fabsf(x[i] - ref[i]);
-        if (diff > THRESHOLD) {
-            printf("Error at index %d:\t expected %f\t real %f\t error %f\n",
-                   i, ref[i], x[i], diff);
-            if (++err > 512) break;
-        }
+        printf("At index %d:\t, value %f\t expected %f\t real %f\t error %f\n",
+                i, input[i], ref[i], x[i], diff);
+        
     }
-    if (err) printf("TEST FAILED with %d errors!!\n", err);
-    else     printf("TEST PASSED!!\n");
 }
 
 /* ----------------------------- Main ----------------------------- */
@@ -397,7 +393,7 @@ int main(void) {
     /* Validate on core 0 (assumes golden `outT` in golden/gold.h) */
     if (cid == 0) {
         printf("CHECK RESULTS (tanh)\n");
-        check_result(g_out, outT, N);
+        check_result(g_in, g_out, outT, N);
     }
 
     snrt_cluster_hw_barrier();

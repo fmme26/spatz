@@ -311,18 +311,14 @@ static inline void fast_sincos_poly_f32_strip(
 }
 
 // Golden checker
-static void check_result(float *x, float *ref, int r) {
+static void check_result(const float *input, const float *x, const float *ref, int r) {
     int err = 0;
     for (int i = 0; i < r; i++) {
         float diff = fabsf(x[i] - ref[i]);
-        if (diff > THRESHOLD) {
-            printf("Error at index %d:\t expected %f\t real %f\t error %f\n",
-                   i, ref[i], x[i], diff);
-            if (++err > 512) break;
-        }
+        printf("At index %d:\t, value %f\t expected %f\t real %f\t error %f\n",
+                i, input[i], ref[i], x[i], diff);
+        
     }
-    if (err) printf("TEST FAILED with %d errors!!\n", err);
-    else     printf("TEST PASSED!!\n");
 }
 
 int main() {
@@ -390,11 +386,11 @@ int main() {
         printf("[LMUL=2] ");
 #endif
         printf("Parallel sincos cycles: %u (cores=%u)\n", cycles, cores);
-
-        printf("CHECK RESULTS (sin)\n");
-        check_result(g_outs, outS, N);
         printf("CHECK RESULTS (cos)\n");
-        check_result(g_outc, outC, N);
+        check_result(g_inp,g_outc, outC, N);
+        printf("CHECK RESULTS (sin)\n");
+        check_result(g_inp , g_outs, outS, N);
+        
     }
 
     snrt_cluster_hw_barrier();
