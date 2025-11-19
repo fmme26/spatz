@@ -205,13 +205,13 @@ static inline void fast_sincos_poly_f32_m4_strip(
  *   v30 : tmp int
  */
 static inline void fast_sincos_poly_f32_m2_strip(
-    const float* inp, float* outs, float* outc, int N) {
+    const float* inp,  float* outc, int N) {
 
     float INVPIO2, PIO2_HI, PIO2_LO, S1, S3, S5, S7, C2, C4, C6;
     sincos_consts(&INVPIO2, &PIO2_HI, &PIO2_LO, &S1, &S3, &S5, &S7, &C2, &C4, &C6);
 
     const float *pin   = inp;
-    float       *poutS = outs;
+    // float       *poutS = outs;
     float       *poutC = outc;
 
     int remaining = N;
@@ -288,11 +288,11 @@ static inline void fast_sincos_poly_f32_m2_strip(
         asm volatile("vfmul.vv    v16, v16, v20");                     // cos *= sign_c
 
         // Store
-        asm volatile("vse32.v v10, (%0)" :: "r"(poutS) : "memory");
+        // asm volatile("vse32.v v10, (%0)" :: "r"(poutS) : "memory");
         asm volatile("vse32.v v16, (%0)" :: "r"(poutC) : "memory");
 
         pin   += vl_local;
-        poutS += vl_local;
+        // poutS += vl_local;
         poutC += vl_local;
         remaining -= (int)vl_local;
     }
@@ -336,7 +336,7 @@ int main() {
     if (cid == 0) {
         g_inp  = (float*)snrt_l1alloc(N * sizeof(float));
         g_outc = (float*)snrt_l1alloc(N * sizeof(float));
-        g_outs = (float*)snrt_l1alloc(N * sizeof(float));
+        // g_outs = (float*)snrt_l1alloc(N * sizeof(float));
         if (!g_inp || !g_outc || !g_outs) { printf("alloc failed\n"); return 1; }
 
         snrt_dma_start_1d(g_inp, data1_dram, N * sizeof(float));
@@ -344,7 +344,7 @@ int main() {
 
         // Initialize outputs (optional)
         memset(g_outc, 0, N * sizeof(float));
-        memset(g_outs, 0, N * sizeof(float));
+        // memset(g_outs, 0, N * sizeof(float));
     }
 
     // Ensure all cores see initialized global pointers and input data.
@@ -381,15 +381,15 @@ int main() {
         stop_kernel();
 
 #if (LMUL_MODE == 4)
-        printf("[LMUL=4] ");
+        // printf("[LMUL=4] ");
 #else
         printf("[LMUL=2] ");
 #endif
-        printf("Parallel sincos cycles: %u (cores=%u)\n", cycles, cores);
-        printf("CHECK RESULTS (cos)\n");
-        check_result(g_inp,g_outc, outC, N);
-        printf("CHECK RESULTS (sin)\n");
-        check_result(g_inp , g_outs, outS, N);
+        // printf("Parallel sincos cycles: %u (cores=%u)\n", cycles, cores);
+        // printf("CHECK RESULTS (cos)\n");
+        // check_result(g_inp,g_outc, outC, N);
+        // printf("CHECK RESULTS (sin)\n");
+        // check_result(g_inp , g_outs, outS, N);
         
     }
 

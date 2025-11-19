@@ -23,20 +23,16 @@
  *
  * Identities / approach:
  *   For EXP_DEG = 0 (Schraudolph):
- *     E(x) ≈ *(float*)&( (uint32_t)( x * C + B ) )
+ *     E(x) ≈ *(float*)&( (uint32_t)( B + C*x ) )   // fused here as vfmacc
  *     with C = 2^23 / ln(2) ≈ 12102203.0f,  B ≈ 1064866805.0f
  *
  *   For EXP_DEG = 2/3/4 (RNE reduction + Chebyshev in r):
  *     y = x*LOG2E ; k = nearint(y) (RNE); r = x - k*LN2
  *     exp(x) ≈ P(r) * 2^k
- *     Degree-2:  P(r) = A0 + r*(A1 + r*A2)
- *     Degree-3:  P(r) = A0 + r*(A1 + r*(A2 + r*A3))
- *     Degree-4:  P(r) = A0 + r*(A1 + r*(A2 + r*(A3 + r*A4)))
- *
- * Notes:
- *   - Domain: all finite x (no special-case handling here).
- *   - Two-core split: core 0 → [0, N/2), core 1 → [N/2, N).
- *   - Golden assumed in golden/gold.h as outE.
+ *     Degree-2:  P(r) = A0 + r*(A1 + r*A2)                      (2 FMAs)
+ *     Degree-3:  P(r) = A0 + r*(A1 + r*(A2 + r*A3))             (3 FMAs)
+ *     Degree-4:  P(r) = A0 + r*(A1 + r*(A2 + r*(A3 + r*A4)))    (4 FMAs)
+ *   The polynomial evaluation below is arranged to maximize vfmacc usage.
  */
 
 #include <stdint.h>
@@ -55,7 +51,7 @@
 #endif
 
 #ifndef EXP_DEG
-#define EXP_DEG 0
+#define EXP_DEG 4
 #endif
 
 #define THRESHOLD 0.00010f
@@ -69,10 +65,10 @@
 #define SCH_B  1064866805.0f   /* bias near (127<<23), tuned */
 
 /* ========================= LMUL = 8 =========================
- * v0  : x / r / P / final
- * v8  : temp P or poly staging
+ * v0  : x / r
+ * v8  : staging (poly)
  * v16 : k (i32) → bits(2^k)
- * v24 : temp
+ * v24 : P / result / temps
  */
 static inline void vexp_m8_strip(const float* inp, float* out, int N) {
     const float *pin  = inp;
@@ -87,13 +83,13 @@ static inline void vexp_m8_strip(const float* inp, float* out, int N) {
         asm volatile("vle32.v   v0, (%0)" :: "r"(pin) : "memory");
 
 #if (EXP_DEG == 0)
-        /* ---- Schraudolph fast exp ---- */
-        asm volatile("vfmul.vf  v24, v0,  %[C]" :: [C]"f"(SCH_C));
-        asm volatile("vfadd.vf  v24, v24, %[B]" :: [B]"f"(SCH_B));
+        /* Schraudolph: v24 = B + C*x  (FMA), then reinterpret to float bits */
+        asm volatile("vfmv.v.f        v24, %[B]" :: [B]"f"(SCH_B));
+        asm volatile("vfmacc.vf       v24, %[C], v0" :: [C]"f"(SCH_C));
         asm volatile("vfcvt.rtz.xu.f.v v24, v24");
-        asm volatile("vse32.v   v24, (%0)" :: "r"(pout) : "memory");
+        asm volatile("vse32.v         v24, (%0)" :: "r"(pout) : "memory");
 
-#else  /* EXP_DEG >= 2: RNE reduction + Chebyshev */
+#else
         /* y = x*LOG2E; k=nearint(y); r = x - k*LN2 */
         asm volatile("vfmul.vf        v24, v0,  %[log2e]" :: [log2e]"f"(LOG2E_F));
         asm volatile("vfcvt.x.f.v     v16, v24");                                   /* k (i32, RNE) */
@@ -101,29 +97,36 @@ static inline void vexp_m8_strip(const float* inp, float* out, int N) {
         asm volatile("vfnmsac.vf      v0,  %[ln2], v24" :: [ln2]"f"(LN2_F));        /* r in v0 */
 
 #  if   (EXP_DEG == 2)
-        /* P(r) = A0 + r*(A1 + r*A2) */
-        asm volatile("vfmv.v.f        v8,  %[a1]" :: [a1]"f"(1.01508951f));
-        asm volatile("vfmacc.vf       v8,  %[a2], v0" :: [a2]"f"(0.50502354f));
-        asm volatile("vfmv.v.f        v24, %[a0]" :: [a0]"f"(0.99992448f));
-        asm volatile("vfmacc.vv       v24, v0,  v8");                                /* P in v24 */
+        /* t = A1 + r*A2 ;   P = A0 + r*t  (2 FMAs) */
+        asm volatile("vfmv.v.f        v8,  %[a1]" :: [a1]"f"(1.01508951f));        /* t ← A1 */
+        asm volatile("vfmacc.vf       v8,  %[a2], v0" :: [a2]"f"(0.50502354f));    /* t += r*A2 */
+        asm volatile("vfmv.v.f        v24, %[a0]" :: [a0]"f"(0.99992448f));        /* P ← A0 */
+        asm volatile("vfmacc.vv       v24, v0,  v8");                               /* P += r*t */
+
 #  elif (EXP_DEG == 3)
-        /* P(r) = A0 + r*(A1 + r*(A2 + r*A3)) */
-        asm volatile("vfmv.v.f        v8,  %[a2]" :: [a2]"f"(0.50502354f));
-        asm volatile("vfmacc.vf       v8,  %[a3], v0" :: [a3]"f"(0.16792160f));     /* A2 + r*A3 */
-        asm volatile("vfmul.vv        v8,  v8,  v0");                                /* r*(...) */
-        asm volatile("vfadd.vf        v8,  v8,  %[a1]" :: [a1]"f"(0.99996230f));    /* A1 + r*(...) */
-        asm volatile("vfmul.vv        v24, v0,  v8");                                /* r*u */
-        asm volatile("vfadd.vf        v24, v24, %[a0]" :: [a0]"f"(0.99992450f));    /* P */
+        /* t = A2 + r*A3 ; u = A1 + r*t ; P = A0 + r*u  (3 FMAs total) */
+        asm volatile("vfmv.v.f        v8,  %[a2]" :: [a2]"f"(0.50502354f));        /* t ← A2 */
+        asm volatile("vfmacc.vf       v8,  %[a3], v0" :: [a3]"f"(0.16792160f));    /* t += r*A3 */
+        asm volatile("vfmv.v.f        v24, %[a1]" :: [a1]"f"(0.99996230f));        /* u ← A1 */
+        asm volatile("vfmacc.vv       v24, v0,  v8");                               /* u += r*t */
+        asm volatile("vfmv.v.f        v8,  %[a0]" :: [a0]"f"(0.99992450f));        /* P ← A0 */
+        asm volatile("vfmacc.vv       v8,  v0,  v24");                              /* P += r*u */
+        asm volatile("vmv.v.v         v24, v8");                                    /* P -> v24 */
+
 #  elif (EXP_DEG == 4)
         /* P(r) = A0 + r*(A1 + r*(A2 + r*(A3 + r*A4))) */
-        asm volatile("vfmv.v.f        v8,  %[a3]" :: [a3]"f"(0.16792161f));
-        asm volatile("vfmacc.vf       v8,  %[a4], v0" :: [a4]"f"(0.04191753f));     /* A3 + r*A4 */
-        asm volatile("vfmul.vv        v8,  v8,  v0");                                /* r*s */
-        asm volatile("vfadd.vf        v8,  v8,  %[a2]" :: [a2]"f"(0.49998870f));    /* A2 + r*s */
-        asm volatile("vfmul.vv        v8,  v8,  v0");                                /* r*t */
-        asm volatile("vfadd.vf        v8,  v8,  %[a1]" :: [a1]"f"(0.99996230f));    /* A1 + r*t */
-        asm volatile("vfmul.vv        v24, v0,  v8");                                /* r*u */
-        asm volatile("vfadd.vf        v24, v24, %[a0]" :: [a0]"f"(1.00000000f));    /* P */
+        asm volatile("vfmv.v.f  v8,  %[a3]" :: [a3]"f"(0.16792161f));          // s ← A3
+        asm volatile("vfmacc.vf v8,  %[a4], v0" :: [a4]"f"(0.04191753f));      // s += r*A4
+
+        asm volatile("vfmv.v.f  v24, %[a2]" :: [a2]"f"(0.49998870f));          // t ← A2
+        asm volatile("vfmacc.vv v24, v0,  v8");                                // t += r*s   (r first!)
+
+        asm volatile("vfmv.v.f  v8,  %[a1]" :: [a1]"f"(0.99996230f));          // u ← A1
+        asm volatile("vfmacc.vv v8,  v0,  v24");                               // u += r*t   (r first!)
+
+        asm volatile("vfmv.v.f  v24, %[a0]" :: [a0]"f"(1.00000000f));          // P ← A0
+        asm volatile("vfmacc.vv v24, v0,  v8");         
+
 #  endif
 
         /* y = P * 2^k via exponent injection */
@@ -140,10 +143,10 @@ static inline void vexp_m8_strip(const float* inp, float* out, int N) {
 }
 
 /* ========================= LMUL = 4 =========================
- * v12 : x / r / P / result
- * v24 : temp
+ * v12 : x / r
+ * v24 : P / temps
  * v16 : k (i32) → bits(2^k)
- * v8  : temp
+ * v8  : staging
  */
 static inline void vexp_m4_strip(const float* inp, float* out, int N) {
     const float *pin  = inp;
@@ -158,10 +161,10 @@ static inline void vexp_m4_strip(const float* inp, float* out, int N) {
         asm volatile("vle32.v   v12, (%0)" :: "r"(pin) : "memory");
 
 #if (EXP_DEG == 0)
-        asm volatile("vfmul.vf  v24, v12, %[C]" :: [C]"f"(SCH_C));
-        asm volatile("vfadd.vf  v24, v24, %[B]" :: [B]"f"(SCH_B));
+        asm volatile("vfmv.v.f        v24, %[B]" :: [B]"f"(SCH_B));
+        asm volatile("vfmacc.vf       v24, %[C], v12" :: [C]"f"(SCH_C));
         asm volatile("vfcvt.rtz.xu.f.v v24, v24");
-        asm volatile("vse32.v   v24, (%0)" :: "r"(pout) : "memory");
+        asm volatile("vse32.v         v24, (%0)" :: "r"(pout) : "memory");
 
 #else
         asm volatile("vfmul.vf        v24, v12, %[log2e]" :: [log2e]"f"(LOG2E_F));
@@ -174,22 +177,27 @@ static inline void vexp_m4_strip(const float* inp, float* out, int N) {
         asm volatile("vfmacc.vf       v8,  %[a2], v12" :: [a2]"f"(0.50502354f));
         asm volatile("vfmv.v.f        v24, %[a0]" :: [a0]"f"(0.99992448f));
         asm volatile("vfmacc.vv       v24, v12, v8");                                /* P in v24 */
+
 #  elif (EXP_DEG == 3)
-        asm volatile("vfmv.v.f        v8,  %[a2]" :: [a2]"f"(0.50502354f));
-        asm volatile("vfmacc.vf       v8,  %[a3], v12" :: [a3]"f"(0.16792160f));
-        asm volatile("vfmul.vv        v8,  v8,  v12");
-        asm volatile("vfadd.vf        v8,  v8,  %[a1]" :: [a1]"f"(0.99996230f));
-        asm volatile("vfmul.vv        v24, v12, v8");
-        asm volatile("vfadd.vf        v24, v24, %[a0]" :: [a0]"f"(0.99992450f));
+        asm volatile("vfmv.v.f        v8,  %[a2]" :: [a2]"f"(0.50502354f));         /* t */
+        asm volatile("vfmacc.vf       v8,  %[a3], v12" :: [a3]"f"(0.16792160f));    /* t += r*A3 */
+        asm volatile("vfmv.v.f        v24, %[a1]" :: [a1]"f"(0.99996230f));         /* u */
+        asm volatile("vfmacc.vv       v24, v12, v8");                                /* u += r*t */
+        asm volatile("vfmv.v.f        v8,  %[a0]" :: [a0]"f"(0.99992450f));         /* P */
+        asm volatile("vfmacc.vv       v8,  v12, v24");                               /* P += r*u */
+        asm volatile("vmv.v.v         v24, v8");
+
 #  elif (EXP_DEG == 4)
-        asm volatile("vfmv.v.f        v8,  %[a3]" :: [a3]"f"(0.16792161f));
-        asm volatile("vfmacc.vf       v8,  %[a4], v12" :: [a4]"f"(0.04191753f));
-        asm volatile("vfmul.vv        v8,  v8,  v12");
-        asm volatile("vfadd.vf        v8,  v8,  %[a2]" :: [a2]"f"(0.49998870f));
-        asm volatile("vfmul.vv        v8,  v8,  v12");
-        asm volatile("vfadd.vf        v8,  v8,  %[a1]" :: [a1]"f"(0.99996230f));
-        asm volatile("vfmul.vv        v24, v12, v8");
-        asm volatile("vfadd.vf        v24, v24, %[a0]" :: [a0]"f"(1.00000000f));
+        asm volatile("vfmv.v.f        v8,  %[a3]" :: [a3]"f"(0.16792161f));         /* s */
+        asm volatile("vfmacc.vf       v8,  %[a4], v12" :: [a4]"f"(0.04191753f));    /* s += r*A4 */
+        asm volatile("vfmv.v.f        v24, %[a2]" :: [a2]"f"(0.49998870f));         /* t */
+        asm volatile("vfmacc.vv       v24, v12, v8");                                /* t += r*s */
+        asm volatile("vfmv.v.f        v8,  %[a1]" :: [a1]"f"(0.99996230f));         /* u */
+        asm volatile("vfmacc.vv       v8,  v12, v24");                               /* u += r*t */
+        asm volatile("vfmv.v.f        v24, %[a0]" :: [a0]"f"(1.00000000f));         /* P */
+        asm volatile("vfmacc.vv       v24, v12, v8");                                /* P += r*u */
+
+        
 #  endif
 
         asm volatile("vadd.vx         v16, v16, %[bias]" :: [bias]"r"(127));
@@ -205,10 +213,10 @@ static inline void vexp_m4_strip(const float* inp, float* out, int N) {
 }
 
 /* ========================= LMUL = 2 =========================
- * v4  : x / r / P / result
- * v10 : temp
+ * v4  : x / r
+ * v10 : P / temps
  * v8  : k (i32) → bits(2^k)
- * v6  : temp
+ * v6  : staging
  */
 static inline void vexp_m2_strip(const float* inp, float* out, int N) {
     const float *pin  = inp;
@@ -223,10 +231,10 @@ static inline void vexp_m2_strip(const float* inp, float* out, int N) {
         asm volatile("vle32.v   v4, (%0)" :: "r"(pin) : "memory");
 
 #if (EXP_DEG == 0)
-        asm volatile("vfmul.vf  v10, v4,  %[C]" :: [C]"f"(SCH_C));
-        asm volatile("vfadd.vf  v10, v10, %[B]" :: [B]"f"(SCH_B));
+        asm volatile("vfmv.v.f        v10, %[B]" :: [B]"f"(SCH_B));
+        asm volatile("vfmacc.vf       v10, %[C], v4" :: [C]"f"(SCH_C));
         asm volatile("vfcvt.rtz.xu.f.v v10, v10");
-        asm volatile("vse32.v   v10, (%0)" :: "r"(pout) : "memory");
+        asm volatile("vse32.v         v10, (%0)" :: "r"(pout) : "memory");
 
 #else
         asm volatile("vfmul.vf        v10, v4,  %[log2e]" :: [log2e]"f"(LOG2E_F));
@@ -239,22 +247,25 @@ static inline void vexp_m2_strip(const float* inp, float* out, int N) {
         asm volatile("vfmacc.vf       v6,  %[a2], v4" :: [a2]"f"(0.50502354f));
         asm volatile("vfmv.v.f        v10, %[a0]" :: [a0]"f"(0.99992448f));
         asm volatile("vfmacc.vv       v10, v4,  v6");                                /* P in v10 */
+
 #  elif (EXP_DEG == 3)
-        asm volatile("vfmv.v.f        v6,  %[a2]" :: [a2]"f"(0.50502354f));
-        asm volatile("vfmacc.vf       v6,  %[a3], v4" :: [a3]"f"(0.16792160f));
-        asm volatile("vfmul.vv        v6,  v6,  v4");
-        asm volatile("vfadd.vf        v6,  v6,  %[a1]" :: [a1]"f"(0.99996230f));
-        asm volatile("vfmul.vv        v10, v4,  v6");
-        asm volatile("vfadd.vf        v10, v10, %[a0]" :: [a0]"f"(0.99992450f));
+        asm volatile("vfmv.v.f        v6,  %[a2]" :: [a2]"f"(0.50502354f));         /* t */
+        asm volatile("vfmacc.vf       v6,  %[a3], v4" :: [a3]"f"(0.16792160f));     /* t += r*A3 */
+        asm volatile("vfmv.v.f        v10, %[a1]" :: [a1]"f"(0.99996230f));         /* u */
+        asm volatile("vfmacc.vv       v10, v4,  v6");                                /* u += r*t */
+        asm volatile("vfmv.v.f        v6,  %[a0]" :: [a0]"f"(0.99992450f));         /* P */
+        asm volatile("vfmacc.vv       v6,  v4,  v10");                               /* P += r*u */
+        asm volatile("vmv.v.v         v10, v6");
+
 #  elif (EXP_DEG == 4)
-        asm volatile("vfmv.v.f        v6,  %[a3]" :: [a3]"f"(0.16792161f));
-        asm volatile("vfmacc.vf       v6,  %[a4], v4" :: [a4]"f"(0.04191753f));
-        asm volatile("vfmul.vv        v6,  v6,  v4");
-        asm volatile("vfadd.vf        v6,  v6,  %[a2]" :: [a2]"f"(0.49998870f));
-        asm volatile("vfmul.vv        v6,  v6,  v4");
-        asm volatile("vfadd.vf        v6,  v6,  %[a1]" :: [a1]"f"(0.99996230f));
-        asm volatile("vfmul.vv        v10, v4,  v6");
-        asm volatile("vfadd.vf        v10, v10, %[a0]" :: [a0]"f"(1.00000000f));
+        asm volatile("vfmv.v.f        v6,  %[a3]" :: [a3]"f"(0.16792161f));         /* s */
+        asm volatile("vfmacc.vf       v6,  %[a4], v4" :: [a4]"f"(0.04191753f));     /* s += r*A4 */
+        asm volatile("vfmv.v.f        v10, %[a2]" :: [a2]"f"(0.49998870f));         /* t */
+        asm volatile("vfmacc.vv       v10, v4,  v6");                                /* t += r*s */
+        asm volatile("vfmv.v.f        v6,  %[a1]" :: [a1]"f"(0.99996230f));         /* u */
+        asm volatile("vfmacc.vv       v6,  v4,  v10");                               /* u += r*t */
+        asm volatile("vfmv.v.f        v10, %[a0]" :: [a0]"f"(1.00000000f));         /* P */
+        asm volatile("vfmacc.vv       v10, v4,  v6");                                /* P += r*u */
 #  endif
 
         asm volatile("vadd.vx         v8,  v8,  %[bias]" :: [bias]"r"(127));
@@ -288,11 +299,8 @@ static void check_result(const float *input, const float *x, const float *ref, i
     for (int i = 0; i < r; i++) {
         float diff = fabsf(x[i] - ref[i]);
         printf("At index %d:\t, value %f\t expected %f\t real %f\t error %f\n",
-                i, input[i], ref[i], x[i], diff);
-        
+               i, input[i], ref[i], x[i], diff);
     }
-    // if (err) printf("TEST FAILED with %d errors!!\n", err);
-    // else     printf("TEST PASSED!!\n");
 }
 
 /* ----------------------------- Main ----------------------------- */
@@ -331,16 +339,18 @@ int main(void) {
 
         unsigned cycles = benchmark_get_cycle() - t0;
         stop_kernel();
-        printf("[exp LMUL=%d DEG=%d] core %u cycles: %u\n", LMUL_MODE, EXP_DEG, cid, cycles);
+        printf("[exp LMUL=%d DEG=%d] core %u cycles: %u\n",
+               LMUL_MODE, EXP_DEG, cid, cycles);
     }
 
     snrt_cluster_hw_barrier();
 
-    /* Validate on core 0 (expects golden `outE` in golden/gold.h) */
+    /* (Optional) golden check */
     if (cid == 0) {
         printf("CHECK RESULTS (exp)\n");
         check_result(g_in,g_out, outE, N);
     }
+    
 
     snrt_cluster_hw_barrier();
     return 0;

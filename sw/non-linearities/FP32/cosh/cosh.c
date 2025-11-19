@@ -50,7 +50,7 @@
 #endif
 
 #ifndef COSH_DEG
-#define COSH_DEG 0
+#define COSH_DEG 2
 #endif
 
 #define THRESHOLD 0.00010f
@@ -60,7 +60,7 @@
 #define LN2    0.6931471805599453f
 
 /* ---- Degree 0: Schraudolph constants (exp) ---- */
-#if (COSH_DEG == 0)
+#if (COSH_DEG == 2)
 #define SCH_C  12102203.0f     /* 2^23 / ln(2) */
 #define SCH_B  1064866805.0f   /* bias (near 127<<23), tuned */
 #endif
@@ -86,11 +86,9 @@ static inline void vcosh_m8_strip(const float* inp, float* out, int N) {
 
 #if (COSH_DEG == 0)
         /* --- Schraudolph: cosh ≈ 0.5*(E(+x)+E(-x)) --- */
-        asm volatile("vfmul.vf  v16, v24, %[neg1]" :: [neg1]"f"(-1.0f));    /* -x */
-        asm volatile("vfmul.vf  v24, v24, %[c]"    :: [c]   "f"(SCH_C));    /* x*C */
-        asm volatile("vfadd.vf  v24, v24, %[b]"    :: [b]   "f"(SCH_B));    /* +B   */
-        asm volatile("vfmul.vf  v16, v16, %[c]"    :: [c]   "f"(SCH_C));    /* -x*C */
-        asm volatile("vfadd.vf  v16, v16, %[b]"    :: [b]   "f"(SCH_B));    /* +B   */
+        asm volatile("vfmul.vf  v16, v24, %[c]"    :: [c]   "f"(SCH_C));    /* x*C */
+        asm volatile("vfadd.vf  v24, v16, %[b]"    :: [b]   "f"(SCH_B));    /* +B + x*c  */
+        asm volatile("vfrsub.vf  v16, v16, %[b]"    :: [b]   "f"(SCH_B));    /* +B - x*c   */
         asm volatile("vfcvt.rtz.xu.f.v v24, v24");                          /* bits E(+x) */
         asm volatile("vfcvt.rtz.xu.f.v v16, v16");                          /* bits E(-x) */
         asm volatile("vfadd.vv  v24, v24, v16");
@@ -146,16 +144,16 @@ static inline void vcosh_m8_strip(const float* inp, float* out, int N) {
         /* 2^k (v16) and 2^{-k} (v0) bit injection */
         asm volatile("vmv.v.v         v0,  v16");                 /* v0 = k (i32) */
         asm volatile("vrsub.vi        v0,  v0,  0");              /* v0 = -k */
-        asm volatile("vadd.vx         v16, v16, %[bias]" :: [bias]"r"(127));
+        asm volatile("vadd.vx         v16, v16, %[bias]" :: [bias]"r"(126));
         asm volatile("vsll.vi         v16, v16, 23");             /* bits(2^k) */
-        asm volatile("vadd.vx         v0,  v0,  %[bias]" :: [bias]"r"(127));
+        asm volatile("vadd.vx         v0,  v0,  %[bias]" :: [bias]"r"(126));
         asm volatile("vsll.vi         v0,  v0,  23");             /* bits(2^-k) */
 
         /* cosh = 0.5*(2^k*Pplus + 2^-k*Pminus)  -> v24 */
         asm volatile("vfmul.vv        v24, v24, v16");
         asm volatile("vfmul.vv        v8,  v8,  v0");
         asm volatile("vfadd.vv        v24, v24, v8");
-        asm volatile("vfmul.vf        v24, v24, %[half]" :: [half]"f"(0.5f));
+        // asm volatile("vfmul.vf        v24, v24, %[half]" :: [half]"f"(0.5f));
 #endif
 
         asm volatile("vse32.v v24, (%0)" :: "r"(pout) : "memory");
