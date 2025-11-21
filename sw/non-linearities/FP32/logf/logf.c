@@ -65,63 +65,57 @@ static float *g_out = NULL;
  *   v16 : m -> t -> ln(m) (float)
  *   v24 : e (int/float) or poly accumulator / temps
  */
-static inline void vlogf_m8_strip(const float* inp, float* out, int N) {
+static inline void vlogf_m8_strip(const float* inp, float* out, int N)
+{
     const float *pin  = inp;
     float       *pout = out;
     int remaining = N;
 
     while (remaining > 0) {
         unsigned long vl;
-        asm volatile("vsetvli %0, %1, e32, m8, ta, ma"
-                     : "=r"(vl) : "r"(remaining) : "memory");
+        asm volatile("vsetvli %0, %1, e32, m8, ta, ma": "=r"(vl): "r"(remaining): "memory");
 
-        // Load x → v8; bitwise copy → v0
+        // Load x → v8
         asm volatile("vle32.v v8, (%0)" :: "r"(pin) : "memory");
-        asm volatile("vmv.v.v  v0, v8");
 
-        // e = ((xi >> 23) - 127)  (int in v24)
-        asm volatile("vmv.v.v   v24, v0");
-        asm volatile("vsrl.vi   v24, v24, 23");
+        // e = ((xi >> 23) - 127) as int in v24
+        asm volatile("vmv.v.v   v24, v8");           // copy x bits
+        asm volatile("vsrl.vi   v24, v24, 23");      // shift exponent to LSB
         asm volatile("vmv.v.x   v16, %0" :: "r"(127));
-        asm volatile("vsub.vv   v24, v24, v16");
+        asm volatile("vsub.vv   v24, v24, v16");     // v24 = e (int)
 
-        // m in [1,2): xi = (xi & 0x7FFFFF) | 0x3F800000
+        // m in [1,2): xi = (xi & 0x7FFFFF) | 0x3F800000  (in v8)
         asm volatile("vmv.v.x   v16, %0" :: "r"(0x007FFFFFu));
-        asm volatile("vand.vv   v0,  v0,  v16");
+        asm volatile("vand.vv   v8,  v8,  v16");     // clear sign+exp
         asm volatile("vmv.v.x   v16, %0" :: "r"(0x3F800000u));
-        asm volatile("vor.vv    v0,  v0,  v16");
+        asm volatile("vor.vv    v8,  v8,  v16");     // v8 = m bits
 
-        // t = m - 1.0  (m as float → v16)
-        asm volatile("vmv.v.v   v16, v0");
+        // t = m - 1.0  → keep in v8
         asm volatile("vfmv.v.f  v0,  %0" :: "f"(1.0f));
-        asm volatile("vfsub.vv  v16, v16, v0");   // v16 = t
+        asm volatile("vfsub.vv  v8, v8, v0");        // v8 = t
 
-        // ln(m) poly: v16 = t * (L1 + t*(L2 + t*(L3 + t*L4)))
-        asm volatile("vfmv.v.f  v24, %0" :: "f"(L4));
-        asm volatile("vfmul.vv  v24, v24, v16");
-        asm volatile("vfadd.vf  v24, v24, %0" :: "f"(L3));
-        asm volatile("vfmul.vv  v24, v24, v16");
-        asm volatile("vfadd.vf  v24, v24, %0" :: "f"(L2));
-        asm volatile("vfmul.vv  v24, v24, v16");
-        asm volatile("vfadd.vf  v24, v24, %0" :: "f"(L1));
-        asm volatile("vfmul.vv  v16, v16, v24");  // v16 = ln(m)
+        // ln(m) poly: ln(1+t) ≈ t * (L1 + t*(L2 + t*(L3 + t*L4)))
+        asm volatile("vfmv.v.f  v0, %0" :: "f"(L4));   // p = L4
+        asm volatile("vfmul.vv  v0, v0, v8");          // p = p*t
+        asm volatile("vfadd.vf  v0, v0, %0" :: "f"(L3));
+        asm volatile("vfmul.vv  v0, v0, v8");          // p = p*t
+        asm volatile("vfadd.vf  v0, v0, %0" :: "f"(L2));
+        asm volatile("vfmul.vv  v0, v0, v8");          // p = p*t
+        asm volatile("vfadd.vf  v0, v0, %0" :: "f"(L1));
+        asm volatile("vfmul.vv  v8, v8, v0");          // v8 = t * p = ln(m)
 
-        // e again (cheap), convert to float
-        asm volatile("vmv.v.v   v24, v8");
-        asm volatile("vsrl.vi   v24, v24, 23");
-        asm volatile("vmv.v.x   v0,  %0" :: "r"(127));
-        asm volatile("vsub.vv   v24, v24, v0");
-        asm volatile("vfcvt.f.x.v v24, v24");     // float(e)
+        // e (int) → float
+        asm volatile("vfcvt.f.x.v v24, v24");          // v24 = (float)e
 
-        // ln(x) = ln(m) + e*ln2   (split for precision)
-        asm volatile("vfmacc.vf v16, %0, v24" :: "f"(LN2_HI));
-        asm volatile("vfmacc.vf v16, %0, v24" :: "f"(LN2_LO));
+        // ln(x) = ln(m) + e*ln2, split for precision
+        asm volatile("vfmacc.vf v8, %0, v24" :: "f"(LN2_HI));
+        asm volatile("vfmacc.vf v8, %0, v24" :: "f"(LN2_LO));
 
-        // Store
-        asm volatile("vse32.v v16, (%0)" :: "r"(pout) : "memory");
+        // Store result
+        asm volatile("vse32.v v8, (%0)" :: "r"(pout) : "memory");
 
-        pin  += vl;
-        pout += vl;
+        pin       += vl;
+        pout      += vl;
         remaining -= (int)vl;
     }
 }

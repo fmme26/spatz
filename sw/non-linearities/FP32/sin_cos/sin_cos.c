@@ -73,6 +73,160 @@ static inline void sincos_consts(float *INVPIO2, float *PIO2_HI, float *PIO2_LO,
     *C4 =  0.0416666679084301f;
     *C6 = -0.0013888889225196834f;
 }
+static inline void vcos_f32_m8_strip(const float* inp, float* outc, int N) {
+    float INVPIO2, PIO2_HI, PIO2_LO, S1, S3, S5, S7, C2, C4, C6;
+    sincos_consts(&INVPIO2, &PIO2_HI, &PIO2_LO, &S1, &S3, &S5, &S7, &C2, &C4, &C6);
+
+    const float *pin = inp;
+    float *pout = outc;
+    int remaining = N;
+
+    while (remaining > 0) {
+        unsigned long vl;
+        asm volatile("vsetvli %0, %1, e32, m8, ta, ma"
+                     : "=r"(vl) : "r"(remaining) : "memory");
+
+        /* x -> v0 */
+        asm volatile("vle32.v v0, (%0)" :: "r"(pin) : "memory");
+
+        /* y = x*(2/pi) -> v24 ; k=int_rne(y) -> v16 ; kf -> v24 */
+        asm volatile("vfmul.vf        v24, v0,  %[A]"  :: [A] "f"(INVPIO2));
+        asm volatile("vfcvt.x.f.v     v16, v24");                 /* k (i32, RNE) */
+        asm volatile("vfcvt.f.x.v     v24, v16");                 /* kf (f32)     */
+
+        /* r = x - kf*PIO2_HI - kf*PIO2_LO -> v0 ; z = r^2 -> v8 */
+        asm volatile("vfnmsac.vf      v0,  %[HI], v24" :: [HI]"f"(PIO2_HI));
+        asm volatile("vfnmsac.vf      v0,  %[LO], v24" :: [LO]"f"(PIO2_LO));
+        asm volatile("vfmul.vv        v8,  v0,  v0");             /* z = r^2      */
+
+        /* s0 = r*(S1 + z*(S3 + z*(S5 + z*S7))) — keep in v0 */
+        asm volatile("vfmv.v.f        v24, %[S7]" :: [S7]"f"(S7));     /* t */
+        asm volatile("vfmacc.vf       v24, %[S5], v8" :: [S5]"f"(S5)); /* t = S5 + z*S7 */
+        asm volatile("vfmul.vv        v24, v24, v8");
+        asm volatile("vfadd.vf        v24, v24, %[S3]" :: [S3]"f"(S3));
+        asm volatile("vfmul.vv        v24, v24, v8");
+        asm volatile("vfadd.vf        v24, v24, %[S1]" :: [S1]"f"(S1));
+        asm volatile("vfmul.vv        v0,  v0,  v24");                 /* v0 = s0 */
+
+        /* c0 = 1 + z*(C2 + z*(C4 + z*C6)) — keep in v24 */
+        asm volatile("vfmv.v.f        v24, %[C4]" :: [C4]"f"(C4));     /* t */
+        asm volatile("vfmacc.vf       v24, %[C6], v8" :: [C6]"f"(C6)); /* t = C4 + z*C6 */
+        asm volatile("vfmul.vv        v24, v24, v8");
+        asm volatile("vfadd.vf        v24, v24, %[C2]" :: [C2]"f"(C2));
+        asm volatile("vfmul.vv        v24, v24, v8");
+        asm volatile("vfadd.vf        v24, v24, %[ONE]" :: [ONE]"f"(1.0f)); /* c0 */
+
+        /* q = k&3; b0 = q&1; b1 = (q>>1)&1  (all in int regs, keep k alive in v16) */
+        asm volatile("vmv.v.v         v8,  v16");        /* v8 = k (int) */
+        asm volatile("vand.vi         v8,  v8, 3");      /* q */
+        asm volatile("vmv.v.v         v16, v8");         /* copy q -> v16 */
+        asm volatile("vsrl.vi         v16, v16, 1");     /* b1 */
+        asm volatile("vand.vi         v16, v16, 1");
+        asm volatile("vand.vi         v8,  v8,  1");     /* b0 */
+
+        /* sign_c = 1 - 2*(b1^b0)  (int -> float in v16) */
+        asm volatile("vxor.vv         v16, v16, v8");
+        asm volatile("vadd.vv         v16, v16, v16");
+        asm volatile("vrsub.vi        v16, v16, 1");
+        asm volatile("vfcvt.f.x.v     v16, v16");
+
+        /* b0f in v8 (float) */
+        asm volatile("vfcvt.f.x.v     v8,  v8");
+
+        /* cos = c0 + b0*(s0 - c0); then apply sign_c */
+        asm volatile("vfsub.vv        v0,  v0,  v24");   /* s0 - c0 (reuse v0) */
+        asm volatile("vfmacc.vv       v24, v0,  v8");    /* c0 += b0*(s0 - c0) */
+        asm volatile("vfmul.vv        v24, v24, v16");   /* apply sign */
+
+        asm volatile("vse32.v v24, (%0)" :: "r"(pout) : "memory");
+
+        pin  += vl;
+        pout += vl;
+        remaining -= (int)vl;
+    }
+}
+/* Fast single-output cosf with RVV (SEW=32, LMUL=4), strip-mined & maskless.
+   Requires FRM = RNE so vfcvt.x.f.v does round-to-nearest-even for k. */
+
+/* Fast single-output cosf with RVV (SEW=32, LMUL=4), strip-mined & maskless.
+   Requires FRM = RNE so vfcvt.x.f.v does round-to-nearest-even for k. */
+
+static inline void vcos_f32_m4_strip(const float* inp, float* outc, int N) {
+    float INVPIO2, PIO2_HI, PIO2_LO, S1, S3, S5, S7, C2, C4, C6;
+    sincos_consts(&INVPIO2, &PIO2_HI, &PIO2_LO, &S1, &S3, &S5, &S7, &C2, &C4, &C6);
+
+    const float *pin  = inp;
+    float       *pout = outc;
+    int remaining = N;
+
+    while (remaining > 0) {
+        unsigned long vl;
+        asm volatile("vsetvli %0, %1, e32, m4, ta, ma"
+                     : "=r"(vl) : "r"(remaining) : "memory");
+
+        /* x -> v12 */
+        asm volatile("vle32.v v12, (%0)" :: "r"(pin) : "memory");
+
+        /* y = x*(2/pi) -> v4 ; k = nearint(y) -> v8 (int) ; kf -> v4 */
+        asm volatile("vfmul.vf        v4,  v12, %[A]"  :: [A] "f"(INVPIO2));
+        asm volatile("vfcvt.x.f.v     v8,  v4");                 /* k (i32, RNE) */
+        asm volatile("vfcvt.f.x.v     v4,  v8");                 /* kf (f32)     */
+
+        /* r = x - kf*PIO2_HI - kf*PIO2_LO -> v12 ; z = r^2 -> v20 */
+        asm volatile("vfnmsac.vf      v12, %[HI], v4" :: [HI]"f"(PIO2_HI));
+        asm volatile("vfnmsac.vf      v12, %[LO], v4" :: [LO]"f"(PIO2_LO));
+        asm volatile("vfmul.vv        v20, v12, v12");           /* z = r^2      */
+
+        /* ---- sin poly: s0 = r*(S1 + z*(S3 + z*(S5 + z*S7))) ----
+           Use FMA chain with one scratch (v4). Result -> v16 (s0). */
+        asm volatile("vfmv.v.f        v4,  %[S5]" :: [S5]"f"(S5));        /* t = S5 */
+        asm volatile("vfmacc.vf       v4,  %[S7], v20" :: [S7]"f"(S7));   /* t = S5 + z*S7 */
+        asm volatile("vfmv.v.f        v16, %[S3]" :: [S3]"f"(S3));        /* u = S3 */
+        asm volatile("vfmacc.vv       v16, v20,  v4");                    /* u = S3 + z*t */
+        asm volatile("vfmv.v.f        v4,  %[S1]" :: [S1]"f"(S1));        /* t = S1 */
+        asm volatile("vfmacc.vv       v4,  v20,  v16");                   /* t = S1 + z*u */
+        asm volatile("vfmul.vv        v16, v12,  v4");                    /* s0 = r*t     */
+
+        /* ---- cos poly: c0 = 1 + z*(C2 + z*(C4 + z*C6)) ----
+           FMA chain. Keep final c0 in v24. */
+        asm volatile("vfmv.v.f        v24, %[C4]" :: [C4]"f"(C4));        /* t = C4 */
+        asm volatile("vfmacc.vf       v24, %[C6], v20" :: [C6]"f"(C6));   /* t = C4 + z*C6 */
+        asm volatile("vfmv.v.f        v4,  %[C2]" :: [C2]"f"(C2));        /* u = C2 */
+        asm volatile("vfmacc.vv       v4,  v20,  v24");                   /* u = C2 + z*t */
+        asm volatile("vfmv.v.f        v24, %[ONE]" :: [ONE]"f"(1.0f));    /* c0 = 1 */
+        asm volatile("vfmacc.vv       v24, v20,  v4");                    /* c0 += z*u    */
+
+        /* ---- quadrant decode & blend for cosine ----
+           q=k&3; b0=q&1; b1=(q>>1)&1;  cos = sign_c * [ c0 + b0*(s0 - c0) ],
+           sign_c = 1 - 2*(b1^b0) */
+        asm volatile("vand.vi         v28, v8, 3");                        /* q          */
+        asm volatile("vmv.v.v         v0,  v28");                          /* copy q     */
+        asm volatile("vsrl.vi         v8,  v28, 1");                       /* b1         */
+        asm volatile("vand.vi         v8,  v8,  1");
+        asm volatile("vand.vi         v0,  v0,  1");                       /* b0         */
+
+        /* sign_c as float in v8, b0f in v0 */
+        asm volatile("vxor.vv         v8,  v8,  v0");                       /* b1^b0      */
+        asm volatile("vadd.vv         v8,  v8,  v8");                       /* *2         */
+        asm volatile("vrsub.vi        v8,  v8,  1");                        /* 1-2*(...)  */
+        asm volatile("vfcvt.f.x.v     v8,  v8");                            /* -> float   */
+        asm volatile("vfcvt.f.x.v     v0,  v0");                            /* b0f        */
+
+        /* cos = c0 + b0f*(s0 - c0) ; apply sign */
+        asm volatile("vfsub.vv        v16, v16, v24");                      /* s0 - c0    */
+        asm volatile("vfmacc.vv       v24, v16, v0");                       /* c0 += ...  */
+        asm volatile("vfmul.vv        v24, v24, v8");                       /* sign_c     */
+
+        /* store */
+        asm volatile("vse32.v v24, (%0)" :: "r"(pout) : "memory");
+
+        pin  += vl;
+        pout += vl;
+        remaining -= (int)vl;
+    }
+}
+
+
 
 /* ========================= LMUL = 4 =========================
  * Register plan (LMUL=4, aligned):
@@ -150,8 +304,8 @@ static inline void fast_sincos_poly_f32_m4_strip(
 
         // Blend magnitudes
         // sin_mag -> v16 = (1-b0)*s0 + b0*c0
-        asm volatile("vfmul.vv    v16, v12, v16");
-        asm volatile("vfmacc.vv   v16, v4,  v24");
+        // asm volatile("vfmul.vv    v16, v12, v16");
+        // asm volatile("vfmacc.vv   v16, v4,  v24");
         // cos_mag -> v24 = (1-b0)*c0 + b0*s0_copy
         asm volatile("vfmul.vv    v24, v12, v24");
         asm volatile("vfmacc.vv   v24, v4,  v20");
@@ -161,25 +315,25 @@ static inline void fast_sincos_poly_f32_m4_strip(
         asm volatile("vand.vi     v20, v20, 1");
 
         // sign_s (int in v12): 1 - 2*b1
-        asm volatile("vadd.vv     v12, v20, v20");
-        asm volatile("vrsub.vi    v12, v12, 1");
+        // asm volatile("vadd.vv     v12, v20, v20");
+        // asm volatile("vrsub.vi    v12, v12, 1");
         // sign_c (int in v4): 1 - 2*(b1^b0)
         asm volatile("vxor.vv     v4,  v20, v8");
         asm volatile("vadd.vv     v4,  v4,  v4");
         asm volatile("vrsub.vi    v4,  v4,  1");
 
         // Convert signs to float, apply
-        asm volatile("vfcvt.f.x.v v20, v12");                         // sign_s
+        // asm volatile("vfcvt.f.x.v v20, v12");                         // sign_s
         asm volatile("vfcvt.f.x.v v12, v4");                          // sign_c
-        asm volatile("vfmul.vv    v16, v16, v20");                    // sin *= sign_s
+        // asm volatile("vfmul.vv    v16, v16, v20");                    // sin *= sign_s
         asm volatile("vfmul.vv    v24, v24, v12");                    // cos *= sign_c
 
         // Store
-        asm volatile("vse32.v v16, (%0)" :: "r"(poutS) : "memory");
+        // asm volatile("vse32.v v16, (%0)" :: "r"(poutS) : "memory");
         asm volatile("vse32.v v24, (%0)" :: "r"(poutC) : "memory");
 
         pin   += vl_local;
-        poutS += vl_local;
+        // poutS += vl_local;
         poutC += vl_local;
         remaining -= (int)vl_local;
     }
@@ -337,7 +491,7 @@ int main() {
         g_inp  = (float*)snrt_l1alloc(N * sizeof(float));
         g_outc = (float*)snrt_l1alloc(N * sizeof(float));
         // g_outs = (float*)snrt_l1alloc(N * sizeof(float));
-        if (!g_inp || !g_outc || !g_outs) { printf("alloc failed\n"); return 1; }
+        // if (!g_inp || !g_outc || !g_outs) { printf("alloc failed\n"); return 1; }
 
         snrt_dma_start_1d(g_inp, data1_dram, N * sizeof(float));
         snrt_dma_wait_all();
@@ -366,13 +520,15 @@ int main() {
     }
 
     // Each core computes its disjoint slice (no load/store collisions).
+    // if (len > 0) {
+    //     fast_sincos_poly_f32_strip(g_inp  + start,
+    //                                g_outs + start,
+    //                                g_outc + start,
+    //                                len);
+    // }
     if (len > 0) {
-        fast_sincos_poly_f32_strip(g_inp  + start,
-                                   g_outs + start,
-                                   g_outc + start,
-                                   len);
+        vcos_f32_m4_strip(g_inp  + start,g_outc + start,len);
     }
-
     // Wait for all cores to finish before stopping the timer and checking.
     snrt_cluster_hw_barrier();
 
@@ -385,9 +541,9 @@ int main() {
 #else
         printf("[LMUL=2] ");
 #endif
-        // printf("Parallel sincos cycles: %u (cores=%u)\n", cycles, cores);
-        // printf("CHECK RESULTS (cos)\n");
-        // check_result(g_inp,g_outc, outC, N);
+        printf("Parallel sincos cycles: %u (cores=%u)\n", cycles, cores);
+        printf("CHECK RESULTS (cos)\n");
+        check_result(g_inp,g_outc, outC, N);
         // printf("CHECK RESULTS (sin)\n");
         // check_result(g_inp , g_outs, outS, N);
         
