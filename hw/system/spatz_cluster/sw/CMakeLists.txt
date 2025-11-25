@@ -15,13 +15,16 @@ include(SnitchUtilities)
 
 enable_testing()
 add_subdirectory(${SNITCH_SOFTWARE_DIR}/snRuntime snRuntime)
-add_subdirectory(${SNITCH_SOFTWARE_DIR}/riscvTests riscvTests)
+# add_subdirectory(${SNITCH_SOFTWARE_DIR}/riscvTests riscvTests)
 # add_subdirectory(${SNITCH_SOFTWARE_DIR}/spatzBenchmarks spatzBenchmarks)
 # add_subdirectory(${SNITCH_SOFTWARE_DIR}/wus wus)
 # add_subdirectory(${SNITCH_SOFTWARE_DIR}/advKernels advKernels)
 # add_subdirectory(${SNITCH_SOFTWARE_DIR}/Yuxing Yuxing)
 #add_subdirectory(${SNITCH_SOFTWARE_DIR}/LLM LLM)
-add_subdirectory(${SNITCH_SOFTWARE_DIR}/non-linearities non_linear)
+# add_subdirectory(${SNITCH_SOFTWARE_DIR}/non-linearities non_linear)
+add_subdirectory(${SNITCH_SOFTWARE_DIR}/EncodingTest encode)
+
+
 
 # add_subdirectory(${SNITCH_SOFTWARE_DIR}/LSTM LSTM)
 # add_subdirectory(${SNITCH_SOFTWARE_DIR}/RandomTest RandomTest)
