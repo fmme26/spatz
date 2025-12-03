@@ -36,6 +36,7 @@
  */
 
 #include <stdint.h>
+#include <inttypes.h>
 #include <math.h>
 #include <snrt.h>
 #include "printf.h"
@@ -51,7 +52,7 @@
 #endif
 
 #ifndef EXP_DEG
-#define EXP_DEG 4
+#define EXP_DEG 0
 #endif
 
 #define THRESHOLD 0.00010f
@@ -86,8 +87,8 @@ static inline void vexp_m8_strip(const float* inp, float* out, int N) {
         /* Schraudolph: v24 = B + C*x  (FMA), then reinterpret to float bits */
         asm volatile("vfmv.v.f        v24, %[B]" :: [B]"f"(SCH_B));
         asm volatile("vfmacc.vf       v24, %[C], v0" :: [C]"f"(SCH_C));
-        asm volatile("vfcvt.rtz.xu.f.v v24, v24");
-        asm volatile("vse32.v         v24, (%0)" :: "r"(pout) : "memory");
+        asm volatile("vfcvt.xu.f.v v8, v24");
+        asm volatile("vse32.v         v8, (%0)" :: "r"(pout) : "memory");
 
 #else
         /* y = x*LOG2E; k=nearint(y); r = x - k*LN2 */
@@ -280,6 +281,24 @@ static inline void vexp_m2_strip(const float* inp, float* out, int N) {
     }
 }
 
+static inline void vexp_custom(const float* inp, float* out, int N) {
+    const float *pin  = inp;
+    float       *pout = out;
+    int remaining = N;
+        while (remaining > 0) {
+                unsigned long vl;
+                asm volatile("vsetvli %0, %1, e32, m8, ta, ma"
+                         : "=r"(vl) : "r"(remaining) : "memory");
+        
+                asm volatile("vle32.v   v0, (%0)" :: "r"(pin) : "memory");
+                asm volatile("vfexpf.v      v8, v0");
+                asm volatile("vse32.v         v8, (%0)" :: "r"(pout) : "memory");
+        
+                pin  += vl;
+                pout += vl;
+                remaining -= (int)vl;
+        }
+}
 /* ------------------- Kernel selector ------------------- */
 static inline void vexp_strip(const float* inp, float* out, int N) {
 #if   (LMUL_MODE == 8)
@@ -294,13 +313,26 @@ static inline void vexp_strip(const float* inp, float* out, int N) {
 }
 
 /* ------------------ Simple golden checker ------------------ */
+static inline uint32_t f32_bits(float v) {
+        uint32_t u;
+        memcpy(&u, &v, sizeof u);
+        return u;
+}
+
 static void check_result(const float *input, const float *x, const float *ref, int r) {
     int err = 0;
     for (int i = 0; i < r; i++) {
         float diff = fabsf(x[i] - ref[i]);
-        printf("At index %d:\t, value %f\t expected %f\t real %f\t error %f\n",
-               i, input[i], ref[i], x[i], diff);
-    }
+        uint32_t in_b  = f32_bits(input[i]);
+        uint32_t ref_b = f32_bits(ref[i]);
+        uint32_t x_b   = f32_bits(x[i]);
+        printf("i=%d input=% .8e (0x%08" PRIx32 ")  ref=% .8e (0x%08" PRIx32 ")  got=% .8e (0x%08" PRIx32 ")  diff=% .3e\n",
+           i,
+           input[i], in_b,
+           ref[i],   ref_b,
+           x[i],     x_b,
+           diff);
+}
 }
 
 /* ----------------------------- Main ----------------------------- */
@@ -335,7 +367,7 @@ int main(void) {
         start_kernel();
         unsigned t0 = benchmark_get_cycle();
 
-        vexp_strip(g_in + start, g_out + start, count);
+        vexp_custom(g_in + start, g_out + start, count);
 
         unsigned cycles = benchmark_get_cycle() - t0;
         stop_kernel();
