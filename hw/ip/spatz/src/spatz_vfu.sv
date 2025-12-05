@@ -117,7 +117,6 @@ module spatz_vfu
 
   // effective VRF needs/mask for operand readiness + requesting
   logic      nl_need_vs1, nl_need_vs2, nl_need_vd;
-  logic [2:0] nl_vrf_rmask;
 
   // operand overrides
   logic                    nl_override_operands;
@@ -212,7 +211,7 @@ module spatz_vfu
 
   // Is this a FPU instruction
   logic is_fpu_insn;
-  assign is_fpu_insn = FPU && ((spatz_req.op inside {[VFADD:VSDOTP]}) || is_nl_op(spatz_req.op));
+  assign is_fpu_insn = FPU && ((spatz_req.op inside {[VFADD:VSDOTP]}) || spatz_req.op == VFEXPF);
 
   // Is the FPU busy?
   logic is_fpu_busy;
@@ -320,16 +319,16 @@ module spatz_vfu
           spatz_req_ready         = 1'b0;
           busy_d                  = 1'b1;
           running_d[spatz_req.id] = 1'b1;
-          vl_d                    = 0;
           widening_upper_d        = 1'b0;
           narrowing_upper_d       = 1'b0;
           last_request            = 1'b0;
-
+          if (nl_uop_last_issue) begin
+              last_request            = 1'b1;
+          end
         end
         if (nl_phase_eff == NL_WAIT) begin
           if (result_tag.uop_last)begin
             spatz_req_ready         = spatz_req_valid;
-            last_request            = 1'b1;
             busy_d                  = 1'b0;
             vl_d                    = '0;
             running_d[spatz_req.id] = 1'b0;
@@ -338,7 +337,6 @@ module spatz_vfu
           end else begin
             spatz_req_ready         = 1'b0;
             busy_d                  = 1'b1;
-            vl_d                    = '0;
             widening_upper_d        = 1'b0;
             narrowing_upper_d       = 1'b0;
           end
@@ -442,10 +440,6 @@ module spatz_vfu
     nl_need_vs2  = spatz_req.use_vs2;
     nl_need_vd   = spatz_req.vd_is_src;
 
-    nl_vrf_rmask = {spatz_req.vd_is_src,
-                    spatz_req.use_vs1 && reduction_operand_request[1],
-                    spatz_req.use_vs2 && reduction_operand_request[0]};
-
     nl_override_operands = 1'b0;
     nl_op1_ovr = '0;
     nl_op2_ovr = '0;
@@ -464,7 +458,6 @@ module spatz_vfu
           nl_need_vs1 = 1'b1; // x on vrf_rdata_i[1]
           nl_need_vs2 = 1'b0;
           nl_need_vd = 1'b0;
-          nl_vrf_rmask = 3'b010; // {vd,vs1,vs2} => vs1 only
           nl_override_operands = 1'b1;
           nl_op1_ovr = sch_c_vec;        // C
           nl_op2_ovr = vrf_rdata_i[1];   // x
@@ -478,8 +471,14 @@ module spatz_vfu
 
         end
 
-        // P1: vd <- vd + C*x  (FMADD(C, vs2, vd)), read vs2 and vd
         NL_WAIT: begin
+          nl_need_vs1 = 1'b0;
+          nl_need_vs2 = 1'b0; // y on vrf_rdata_i[0]
+          nl_need_vd  = 1'b0; // vd on vrf_rdata_i[2]
+          nl_override_operands = 1'b0;
+          
+
+          nl_override_fpu    = 1'b0;
 
         end
 
@@ -1198,8 +1197,10 @@ module spatz_vfu
       assign fpu_operand2 = wide_operand2[fpu*ELEN +: ELEN];
       assign fpu_operand3 = (fpu_op == fpnew_pkg::ADD || spatz_req.op_arith.switch_rs1_rd) ? wide_operand1[fpu*ELEN +: ELEN] : wide_operand3[fpu*ELEN +: ELEN];
 
-      logic int_fpu_in_valid;
-      assign int_fpu_in_valid = spatz_req_valid && operands_ready && (!spatz_req.op_arith.is_scalar || fpu == 0) && is_fpu_insn;
+      logic int_fpu_in_valid, is_fpu_in_valid_en_nl;
+      assign is_fpu_in_valid_en_nl = nl_active_eff ?  nl_override_fpu : 1'b1;
+      assign int_fpu_in_valid = spatz_req_valid && operands_ready && (!spatz_req.op_arith.is_scalar || fpu == 0) && is_fpu_insn && is_fpu_in_valid_en_nl;
+      
 
       // Generate an FPU pipeline
       elen_t fpu_operand1_q, fpu_operand2_q, fpu_operand3_q;

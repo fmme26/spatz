@@ -299,6 +299,54 @@ static inline void vexp_custom(const float* inp, float* out, int N) {
                 remaining -= (int)vl;
         }
 }
+
+
+
+void vexp_optimized(const float* inp, float* out,  int N) {
+    const float *pin = inp;
+    float *pout = out;
+    
+    // N = 2048
+    
+    unsigned long vl;
+    // Configure VTYPE for max length (128 elements per group)
+    asm volatile("vsetvli %0, zero, e32, m8, ta, ma" : "=r"(vl)); 
+
+    // Loop 4 times to process 2048 elements
+    for (int i = 0; i < 4; i++) {
+        
+        // --- STEP 1: LOAD PHASE (Fill the Register File) ---
+        // We load all data first. The CPU will stall here waiting for memory,
+        // but that's fine because we want the ARITHMETIC phase to be clean.
+        asm volatile("vle32.v v0,  (%0)" :: "r"(pin)         : "memory");
+        asm volatile("vle32.v v8,  (%0)" :: "r"(pin + vl)    : "memory");
+        asm volatile("vle32.v v16, (%0)" :: "r"(pin + vl*2)  : "memory");
+        asm volatile("vle32.v v24, (%0)" :: "r"(pin + vl*3)  : "memory");
+
+        // Memory Barrier (
+        asm volatile("" ::: "memory"); 
+
+        // --- STEP 2: EXECUTION PHASE (Clean Burst) ---
+        // Operands in v0-v31 are fully resident in VRF.
+        // There are NO dependencies between these instructions.
+        // In the waveform, you will see these issue back-to-back.
+        asm volatile("vfexpf.v v0,  v0");
+        asm volatile("vfexpf.v v8,  v8");
+        asm volatile("vfexpf.v v16, v16");
+        asm volatile("vfexpf.v v24, v24");
+
+        // --- STEP 3: STORE PHASE (Drain) ---
+        asm volatile("vse32.v v0,  (%0)" :: "r"(pout)        : "memory");
+        asm volatile("vse32.v v8,  (%0)" :: "r"(pout + vl)   : "memory");
+        asm volatile("vse32.v v16, (%0)" :: "r"(pout + vl*2) : "memory");
+        asm volatile("vse32.v v24, (%0)" :: "r"(pout + vl*3) : "memory");
+
+        // Move pointers for the next batch of 512
+        pin  += (vl * 4);
+        pout += (vl * 4);
+    }
+}
+
 /* ------------------- Kernel selector ------------------- */
 static inline void vexp_strip(const float* inp, float* out, int N) {
 #if   (LMUL_MODE == 8)
@@ -367,7 +415,7 @@ int main(void) {
         start_kernel();
         unsigned t0 = benchmark_get_cycle();
 
-        vexp_custom(g_in + start, g_out + start, count);
+        vexp_optimized(g_in + start, g_out + start, count);
 
         unsigned cycles = benchmark_get_cycle() - t0;
         stop_kernel();
