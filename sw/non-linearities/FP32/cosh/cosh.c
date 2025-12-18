@@ -50,7 +50,7 @@
 #endif
 
 #ifndef COSH_DEG
-#define COSH_DEG 2
+#define COSH_DEG 0
 #endif
 
 #define THRESHOLD 0.00010f
@@ -60,7 +60,7 @@
 #define LN2    0.6931471805599453f
 
 /* ---- Degree 0: Schraudolph constants (exp) ---- */
-#if (COSH_DEG == 2)
+#if (COSH_DEG == 0)
 #define SCH_C  12102203.0f     /* 2^23 / ln(2) */
 #define SCH_B  1064866805.0f   /* bias (near 127<<23), tuned */
 #endif
@@ -340,6 +340,50 @@ static inline void vcosh_m2_strip(const float* inp, float* out, int N) {
     }
 }
 
+void vcosh_optimized(const float* inp, float* out,  int N) {
+    const float *pin = inp;
+    float *pout = out;
+    
+    // N = 2048
+    
+    unsigned long vl;
+    // Configure VTYPE for max length (128 elements per group)
+    asm volatile("vsetvli %0, zero, e32, m8, ta, ma" : "=r"(vl)); 
+
+    // Loop 4 times to process 2048 elements
+    for (int i = 0; i < 4; i++) {
+        
+        // --- STEP 1: LOAD PHASE (Fill the Register File) ---
+        // We load all data first. The CPU will stall here waiting for memory,
+        // but that's fine because we want the ARITHMETIC phase to be clean.
+        asm volatile("vle32.v v0,  (%0)" :: "r"(pin)         : "memory");
+        asm volatile("vle32.v v8,  (%0)" :: "r"(pin + vl)    : "memory");
+        asm volatile("vle32.v v16, (%0)" :: "r"(pin + vl*2)  : "memory");
+        asm volatile("vle32.v v24, (%0)" :: "r"(pin + vl*3)  : "memory");
+
+        // Memory Barrier (
+        asm volatile("" ::: "memory"); 
+
+        // --- STEP 2: EXECUTION PHASE (Clean Burst) ---
+        // Operands in v0-v31 are fully resident in VRF.
+        // There are NO dependencies between these instructions.
+        // In the waveform, you will see these issue back-to-back.
+        asm volatile("vfcoshf.v v0,  v0");
+        asm volatile("vfcoshf.v v8,  v8");
+        asm volatile("vfcoshf.v v16, v16");
+        asm volatile("vfcoshf.v v24, v24");
+
+        // --- STEP 3: STORE PHASE (Drain) ---
+        asm volatile("vse32.v v0,  (%0)" :: "r"(pout)        : "memory");
+        asm volatile("vse32.v v8,  (%0)" :: "r"(pout + vl)   : "memory");
+        asm volatile("vse32.v v16, (%0)" :: "r"(pout + vl*2) : "memory");
+        asm volatile("vse32.v v24, (%0)" :: "r"(pout + vl*3) : "memory");
+
+        // Move pointers for the next batch of 512
+        pin  += (vl * 4);
+        pout += (vl * 4);
+    }
+}
 /* ------------------- Kernel selector ------------------- */
 static inline void vcosh_strip(const float* inp, float* out, int N) {
 #if   (LMUL_MODE == 8)
