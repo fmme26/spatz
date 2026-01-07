@@ -72,9 +72,10 @@ module spatz_vfu
 
     // --- NL additions ---
     logic      uop_last;   // last word of the *current phase*
+    logic      last_phase; // last phase of the NL macro
     logic      nl;         // this uop belongs to an NL macro
     nl_phase_e nl_phase;   // which NL phase produced this uop
-    nl_op_e    nl_op_sel;    // which NL op (exp or cosh)
+    nl_op_e    nl_op_sel;  // which NL op (exp or cosh)
   } vfu_tag_t;
   
   // AFTER BELLOW MODIFICATION: 
@@ -115,8 +116,9 @@ module spatz_vfu
 
   logic      nl_start;
   nl_phase_e nl_phase_eff;
-  nl_op_e    nl_op_sel;
+  nl_op_e    nl_func;
   logic      nl_active_eff;
+  logic      is_last_uop;
 
   // effective VRF needs/mask for operand readiness + requesting
   logic      nl_need_vs1, nl_need_vs2, nl_need_vd;
@@ -223,6 +225,18 @@ module spatz_vfu
   assign is_nl_op = is_nl_op_func(spatz_req.op);
   assign is_fpu_insn = FPU && ((spatz_req.op inside {[VFADD:VSDOTP]}) || is_nl_op);
 
+  always_comb begin
+    if (is_nl_op) begin
+      unique case (spatz_req.op)
+        VFEXPF:   nl_func = EXPS;
+        VFCOSHF:  nl_func = COSHS;
+        default:  nl_func = EXPS; 
+      endcase
+    end else begin
+      nl_func = EXPS; 
+    end
+  end
+
   // Is the FPU busy?
   logic is_fpu_busy;
 
@@ -325,7 +339,7 @@ module spatz_vfu
     // Finished the execution!
     if (spatz_req_valid && ((vl_d >= spatz_req.vl && !spatz_req.op_arith.is_reduction) || reduction_done)) begin
       if (nl_active_eff) begin
-        if (nl_phase_eff == NL_FPU_ISSUE_0) begin
+        if (nl_phase_eff == NL_FPU_ISSUE_0 || nl_phase_eff == NL_FPU_ISSUE_1 || nl_phase_eff == NL_SUM_EXP) begin
           spatz_req_ready         = 1'b0;
           busy_d                  = 1'b1;
           running_d[spatz_req.id] = 1'b1;
@@ -416,7 +430,7 @@ module spatz_vfu
 
   // per-phase "last uop issued" marker (used for draining)
   assign nl_uop_last_issue = word_issued && ((vl_q + nr_elem_word) >= spatz_req.vl);
-
+  logic  nl_loopback;
   // NL phase FSM (advance only on drain)
   always_comb begin
     nl_phase_d      = nl_phase_q;
@@ -441,10 +455,10 @@ module spatz_vfu
 
         VFCOSHF: begin
         unique case (nl_phase_q)
-          NL_IDLE:        if (nl_start)           nl_phase_d = NL_FPU_ISSUE_0;
-          NL_FPU_ISSUE_0: if (nl_uop_last_issue)  nl_phase_d = NL_FPU_ISSUE_1;
-          NL_FPU_ISSUE_1: if (nl_uop_last_issue)  nl_phase_d = NL_SUM_EXP;
-          NL_SUM_EXP:     if (nl_uop_last_issue)  nl_phase_d = NL_WAIT;
+          NL_IDLE:        if (nl_start) nl_phase_d = NL_FPU_ISSUE_0;
+          NL_FPU_ISSUE_0:               nl_phase_d = NL_FPU_ISSUE_1;
+          NL_FPU_ISSUE_1:               nl_phase_d = nl_loopback ? NL_FPU_ISSUE_0 : NL_SUM_EXP;
+          NL_SUM_EXP:                   nl_phase_d = NL_WAIT;
           NL_WAIT: begin
             if (result_tag.uop_last && &(result_valid | ~pending_results)) begin
               nl_phase_d = NL_IDLE;
@@ -458,6 +472,7 @@ module spatz_vfu
       endcase
     end
   end
+logic  nl_stop_issue;
 
   // NL decode -> effective VRF needs, operands, and FPU overrides
   always_comb begin
@@ -465,6 +480,9 @@ module spatz_vfu
     nl_need_vs1  = spatz_req.use_vs1;
     nl_need_vs2  = spatz_req.use_vs2;
     nl_need_vd   = spatz_req.vd_is_src;
+    is_last_uop = 1'b0;
+    nl_stop_issue = 1'b0;
+    nl_loopback = 1'b0;
 
     nl_override_operands = 1'b0;
     nl_op1_ovr = '0;
@@ -477,10 +495,9 @@ module spatz_vfu
     nl_fpu_rm_ovr      = spatz_req.rm;
     nl_fpu_int_fmt_ovr = fpnew_pkg::INT32;
 
-    if (nl_active_eff && (spatz_req.op == VFEXPF)) begin
+    if (nl_active_eff) begin
       unique case (spatz_req.op)
         VFEXPF:
-        nl_op_sel = EXPS;
           unique case (nl_phase_eff)
             // P0: vd <- B (FMADD(0,0,B)), no VRF reads
             NL_FPU_ISSUE_0: begin
@@ -497,6 +514,7 @@ module spatz_vfu
               nl_fpu_op_mode_ovr    = 1'b0;
               nl_fpu_rm_ovr         = spatz_req.rm;
               nl_fpu_int_fmt_ovr    = fpnew_pkg::INT32;
+              is_last_uop           = 1'b1;
 
             end
 
@@ -508,34 +526,38 @@ module spatz_vfu
               
 
               nl_override_fpu       = 1'b0;
+              is_last_uop           = 1'b1;
 
             end
 
         default: ;
         endcase
       VFCOSHF:
-      nl_op_sel = COSHS;
           unique case (nl_phase_eff)
-            // P0: vd <- cosh(x) (FCOSH(x)), no VRF reads
+            // P0: vd <- cosh(x) (FCOSH(x))
             NL_FPU_ISSUE_0: begin
-              nl_need_vs1           = 1'b0;
+              nl_need_vs1           = 1'b1;
               nl_need_vs2           = 1'b0;
               nl_need_vd            = 1'b0;
               nl_override_operands  = 1'b1;
               nl_op1_ovr            = sch_c_vec;        // C
               nl_op2_ovr            = vrf_rdata_i[1];   // x
               nl_op3_ovr            = sch_b_cosh_vec;        // B
+              nl_stop_issue         = 1'b1;
 
               nl_override_fpu       = 1'b1;
               nl_fpu_op_ovr         = fpnew_pkg::FMADD;
               nl_fpu_op_mode_ovr    = 1'b0;
               nl_fpu_rm_ovr         = spatz_req.rm;
               nl_fpu_int_fmt_ovr    = fpnew_pkg::INT32;
+              nl_loopback           = nl_loopback;
+              
 
             end
 
             NL_FPU_ISSUE_1: begin
-              nl_need_vs1           = 1'b0;
+              nl_stop_issue         = 1'b0;
+              nl_need_vs1           = 1'b1;
               nl_need_vs2           = 1'b0;
               nl_need_vd            = 1'b0;
               nl_override_operands  = 1'b1;
@@ -548,6 +570,7 @@ module spatz_vfu
               nl_fpu_op_mode_ovr    = 1'b1;
               nl_fpu_rm_ovr         = spatz_req.rm;
               nl_fpu_int_fmt_ovr    = fpnew_pkg::INT32;
+              nl_loopback           = nl_loopback ^ 1'b1;
             end
 
             NL_SUM_EXP: begin
@@ -561,6 +584,7 @@ module spatz_vfu
               nl_fpu_op_mode_ovr    = 1'b0;
               nl_fpu_rm_ovr         = spatz_req.rm;
               nl_fpu_int_fmt_ovr    = fpnew_pkg::INT32;
+              is_last_uop           = 1'b1;
 
             end
 
@@ -569,6 +593,7 @@ module spatz_vfu
               nl_need_vs2           = 1'b0; // y on vrf_rdata_i[0]
               nl_need_vd            = 1'b0; // vd on vrf_rdata_i[2]
               nl_override_operands  = 1'b0;
+              is_last_uop           = 1'b1;
 
               nl_override_fpu       = 1'b0;
 
@@ -682,7 +707,7 @@ module spatz_vfu
     unique case (reduction_state_q)
       Reduction_NormalExecution: begin
         // Did we issue a word to the FUs?
-        word_issued = spatz_req_valid && &(in_ready | ~valid_operations) && operands_ready && !stall;
+        word_issued = spatz_req_valid && &(in_ready | ~valid_operations) && operands_ready && !stall && !nl_stop_issue;
 
         // Are we ready to accept a result?
         result_ready = &(result_valid | ~pending_results) && ((result_tag.wb && vfu_rsp_ready_i) || vrf_wvalid_i);
@@ -855,9 +880,10 @@ module spatz_vfu
 
       // nl fields 
       uop_last       : nl_active_eff ? nl_uop_last_issue : last_request,
+      last_phase     : nl_active_eff ? is_last_uop : 1'b0,
       nl             : nl_active_eff,
-      nl_phase       : nl_phase_d,
-      nl_op_sel      : nl_op_sel
+      nl_op_sel      : nl_func, 
+      nl_phase       : nl_phase_d
     };
 
     if (spatz_req_valid && vl_q == '0) begin

@@ -72,15 +72,14 @@ module spatz_fpu #(
   } output_t;
 
   typedef enum logic [2:0] { EXPS, COSHS } nl_op_e;
-  nl_op_e nl_op_sel;
-
-  logic [3:0] nl_cnt_uop_q;
-  logic       nl_last_uop_q; 
-
 
   TagType fconv_tag;
   logic nl_concatenate;
   logic nl_opmode;
+  logic nl_last_uop_eff;
+  logic [63:0] nl_intermediate;
+  
+  
   fpnew_pkg::operation_e nl_op;
   fpnew_pkg::roundmode_e nl_rnd;
   assign nl_concatenate = tag_i.nl;
@@ -114,15 +113,6 @@ module spatz_fpu #(
         fconv_tag       = tag_i;
       end
     end
-  // Determine last uop for NL concatenation
-logic nl_last_uop;
-always_comb begin : last_uop
-    case (tag_i.nl_op_sel)
-      EXPS:        nl_last_uop = (nl_cnt_uop_q == 4'd7) ? 1'b1 : 1'b0;
-      COSHS:       nl_last_uop = (nl_cnt_uop_q == 4'd7) ? 1'b1 : 1'b0;
-      default:      nl_last_uop = 1'b0;
-    endcase
-  end
   // -----------
   // Input Side
   // -----------
@@ -224,9 +214,11 @@ always_comb begin : last_uop
       .busy_o          ( opgrp_busy[opgrp]           )
     );
     always_comb begin : mux_out_inp_concat
-      // For NL concatenation, only OpGroup 3 (conv) produces valid outputs
-      if (nl_concatenate) begin
-        concatenate_out_valid[opgrp] = opgrp_out_valid[opgrp] & (opgrp == 3);
+      if (nl_concatenate && tag_i.last_phase) begin
+        unique case(tag_i.nl_op_sel)
+          EXPS: concatenate_out_valid[opgrp] = opgrp_out_valid[opgrp] & (opgrp == 3);
+          COSHS: concatenate_out_valid[opgrp] = opgrp_out_valid[opgrp] & (opgrp == 0);
+        endcase
       end else begin
         concatenate_out_valid[opgrp] =  opgrp_out_valid[opgrp];
       end
