@@ -37,6 +37,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <snrt.h>
+#include <inttypes.h>
 #include "printf.h"
 #include <spatz_cluster_peripheral.h>
 #include "data/data.h"
@@ -46,7 +47,7 @@
 #include <string.h>
 
 #ifndef LMUL_MODE
-#define LMUL_MODE 8
+#define LMUL_MODE 2
 #endif
 
 #ifndef COSH_DEG
@@ -266,7 +267,7 @@ static inline void vcosh_m2_strip(const float* inp, float* out, int N) {
 
     while (remaining > 0) {
         unsigned long vl;
-        asm volatile("vsetvli %0, %1, e32, m2, ta, ma"
+        asm volatile("vsetvli %0, %1, e32, m1, ta, ma"
                      : "=r"(vl) : "r"(remaining) : "memory");
 
         asm volatile("vle32.v   v4, (%0)" :: "r"(pin) : "memory"); /* x -> v4 */
@@ -339,7 +340,48 @@ static inline void vcosh_m2_strip(const float* inp, float* out, int N) {
         remaining -= (int)vl;
     }
 }
+void vcosh_optimized_v8(const float* inp, float* out,  int N) {
+    const float *pin = inp;
+    float *pout = out;
+    
+    // N = 2048
+    
+    unsigned long vl;
+    // Configure VTYPE for max length (128 elements per group)
+    asm volatile("vsetvli %0, zero, e32, m8, ta, ma" : "=r"(vl)); 
 
+    // Loop 4 times to process 2048 elements
+    for (int i = 0; i < 4; i++) {
+        
+        // --- STEP 1: LOAD PHASE (Fill the Register File) ---
+        asm volatile("vle32.v v0,  (%0)" :: "r"(pin)         : "memory");
+        asm volatile("vle32.v v8,  (%0)" :: "r"(pin + vl)    : "memory");
+        asm volatile("vle32.v v16, (%0)" :: "r"(pin + vl*2)  : "memory");
+        asm volatile("vle32.v v24, (%0)" :: "r"(pin + vl*3)  : "memory");
+
+        // Memory Barrier (
+        asm volatile("" ::: "memory"); 
+
+        // --- STEP 2: EXECUTION PHASE (Clean Burst) ---
+        // Operands in v0-v31 are fully resident in VRF.
+        // There are NO dependencies between these instructions.
+        // In the waveform, you will see these issue back-to-back.
+        asm volatile("vfcoshf.v v0,  v0");
+        asm volatile("vfcoshf.v v8,  v8");
+        asm volatile("vfcoshf.v v16,  v16");
+        asm volatile("vfcoshf.v v24,  v24");
+
+        // --- STEP 3: STORE PHASE (Drain) ---
+        asm volatile("vse32.v v0,  (%0)" :: "r"(pout)        : "memory");
+        asm volatile("vse32.v v8,  (%0)" :: "r"(pout + vl)   : "memory");
+        asm volatile("vse32.v v16, (%0)" :: "r"(pout + vl*2) : "memory");
+        asm volatile("vse32.v v24, (%0)" :: "r"(pout + vl*3) : "memory");
+
+        // Move pointers for the next batch of 512
+        pin  += (vl * 4);
+        pout += (vl * 4);
+    }
+}
 void vcosh_optimized(const float* inp, float* out,  int N) {
     const float *pin = inp;
     float *pout = out;
@@ -395,17 +437,28 @@ static inline void vcosh_strip(const float* inp, float* out, int N) {
 #endif
 }
 
-/* ------------------ Simple golden checker ------------------ */
+static inline uint32_t f32_bits(float v) {
+        uint32_t u;
+        memcpy(&u, &v, sizeof u);
+        return u;
+}
+
 static void check_result(const float *input, const float *x, const float *ref, int r) {
     int err = 0;
     for (int i = 0; i < r; i++) {
         float diff = fabsf(x[i] - ref[i]);
-        printf("At index %d:\t, value %f\t expected %f\t real %f\t error %f\n",
-                i, input[i], ref[i], x[i], diff);
-        
-    }
+        uint32_t in_b  = f32_bits(input[i]);
+        uint32_t ref_b = f32_bits(ref[i]);
+        uint32_t x_b   = f32_bits(x[i]);
+        uint32_t diff_b= f32_bits(diff);
+        printf("i=%d input=% .8e (0x%08" PRIx32 ")  ref=% .8e (0x%08" PRIx32 ")  got=% .8e (0x%08" PRIx32 ")  diff=% .8e (0x%08" PRIx32 ") \n",
+           i,
+           input[i], in_b,
+           ref[i],   ref_b,
+           x[i],     x_b,
+           diff,diff_b);
 }
-
+}
 /* ----------------------------- Main ----------------------------- */
 int main(void) {
     const unsigned int cid = snrt_cluster_core_idx();
@@ -438,7 +491,7 @@ int main(void) {
         start_kernel();
         unsigned t0 = benchmark_get_cycle();
 
-        vcosh_optimized(g_in + start, g_out + start, count);
+        vcosh_m2_strip(g_in + start, g_out + start, count);
 
         unsigned cycles = benchmark_get_cycle() - t0;
         stop_kernel();

@@ -48,7 +48,7 @@ module spatz_vfu
   // -------------------------
   // NL (non-linear) sequencer
   // -------------------------
-  typedef enum logic [2:0] { NL_IDLE, NL_FPU_ISSUE_0,NL_FPU_ISSUE_1,NL_SUM_EXP, NL_WAIT } nl_phase_e;
+  typedef enum logic [2:0] { NL_IDLE, NL_FPU_ISSUE_0,NL_FPU_ISSUE_1, NL_WAIT } nl_phase_e;
   typedef enum logic [2:0] { EXPS, COSHS } nl_op_e;
 
   // Instruction tag (propagated together with the operands through the pipelines)
@@ -138,9 +138,9 @@ module spatz_vfu
   logic nl_uop_last_issue;
 
   // Schraudolph constants (FP32)
-  localparam logic [31:0] SCH_C_FP32 = 32'h4B38AA3B; // 12102203.0f
-  localparam logic [31:0] SCH_B_FP32 = 32'h4E7DE250; // 1064866805.0f
-  localparam logic [31:0] SCH_B_COSH_FP32 = 32'h3F000000; // 1056964608.0f
+  localparam logic [31:0] SCH_C_FP32 = 32'h4B38AA3B; // 12.102.203.0f
+  localparam logic [31:0] SCH_B_FP32 = 32'h4E7DE250; // 1.064.866.805.0f
+  localparam logic [31:0] SCH_B_COSH_FP32 = 32'h4e7bdf00; // 1.056.964.608.0f
   localparam logic [31:0] F32_ZERO   = 32'h00000000;
 
   logic [31:0] sch_c_sew, sch_b_sew, sch_b_cosh_sew, f32_zero_sew;
@@ -339,7 +339,7 @@ module spatz_vfu
     // Finished the execution!
     if (spatz_req_valid && ((vl_d >= spatz_req.vl && !spatz_req.op_arith.is_reduction) || reduction_done)) begin
       if (nl_active_eff) begin
-        if (nl_phase_eff == NL_FPU_ISSUE_0 || nl_phase_eff == NL_FPU_ISSUE_1 || nl_phase_eff == NL_SUM_EXP) begin
+        if (nl_phase_eff == NL_FPU_ISSUE_0 || nl_phase_eff == NL_FPU_ISSUE_1 ) begin
           spatz_req_ready         = 1'b0;
           busy_d                  = 1'b1;
           running_d[spatz_req.id] = 1'b1;
@@ -568,10 +568,13 @@ logic  nl_stop_issue;
 
               nl_override_fpu       = 1'b1;
               nl_fpu_op_ovr         = fpnew_pkg::FNMSUB;
-              nl_fpu_op_mode_ovr    = 1'b1;
+              nl_fpu_op_mode_ovr    = 1'b0;
               nl_fpu_rm_ovr         = spatz_req.rm;
               nl_fpu_int_fmt_ovr    = fpnew_pkg::INT32;
               nl_loopback_d         = 1'b1;
+              if (nl_loopback_q) begin
+                is_last_uop           = 1'b1;
+              end
             end
 
 
@@ -582,6 +585,7 @@ logic  nl_stop_issue;
               nl_override_operands  = 1'b0;
               is_last_uop           = 1'b1;
               nl_override_fpu       = 1'b0;
+              nl_loopback_d         = 1'b0;
 
             end
 
@@ -869,7 +873,7 @@ logic  nl_stop_issue;
       last_phase     : nl_active_eff ? is_last_uop : 1'b0,
       nl             : nl_active_eff,
       nl_op_sel      : nl_func, 
-      nl_phase       : nl_phase_q
+      nl_phase       : nl_phase_eff
     };
 
     if (spatz_req_valid && vl_q == '0) begin

@@ -72,14 +72,14 @@ module spatz_fpu #(
     TagType             tag;
   } output_t;
 
-  typedef enum logic [2:0] { NL_IDLE, NL_FPU_ISSUE_0,NL_FPU_ISSUE_1,NL_SUM_EXP, NL_WAIT } nl_phase_e;
+  typedef enum logic [2:0] { NL_IDLE, NL_FPU_ISSUE_0,NL_FPU_ISSUE_1, NL_WAIT } nl_phase_e;
   typedef enum logic [2:0] { EXPS, COSHS } nl_op_e;
 
   TagType fconv_tag, fadd_tag;
   logic nl_concatenate;
   logic nl_opmode_conv, nl_opmode_add;
-  logic nl_wr_en, is_last_uop;
-  
+  logic nl_wr_en, is_last_uop_d, is_last_uop_q;
+  `FF(is_last_uop_q, is_last_uop_d, 1'b0)
   
   fpnew_pkg::operation_e nl_op_conv, nl_op_add, nl_op;
   fpnew_pkg::roundmode_e nl_rnd_conv, nl_rnd_add, nl_rnd;
@@ -96,8 +96,7 @@ module spatz_fpu #(
 
   logic [NUM_FORMATS-1:0][NUM_OPERANDS-1:0] is_boxed;
   logic [NUM_OPGROUPS-1:0] concatenate_in_valid;
-  logic add_phase_q, add_phase_d;
-  `FF(add_phase_q, add_phase_d, 1'b0)
+  
 
   always_comb begin : select_inputs
     operands_fconv = '0;
@@ -112,7 +111,7 @@ module spatz_fpu #(
     fadd_tag       = '0;
     out_opgrp_ready = opgrp_out_ready;
     nl_wr_en       = 1'b0;
-    add_phase_d    = add_phase_q;
+    is_last_uop_d   = is_last_uop_q;
 
     unique case(tag_i.nl_op_sel)
       EXPS: begin
@@ -124,12 +123,12 @@ module spatz_fpu #(
           nl_op_conv                          = fpnew_pkg::F2I;
           nl_rnd_conv                         = fpnew_pkg::RTZ;
           fconv_tag                           =  opgrp_outputs[fpnew_pkg::ADDMUL].tag;
-          out_opgrp_ready[0]                  = opgrp_in_ready[3] ? 'b1 : 'b0; 
+          out_opgrp_ready[0]                  = opgrp_in_ready[3]; 
           //out_opgrp_ready[NUM_OPGROUPS-1 :1]  = opgrp_out_ready[NUM_OPGROUPS-1 :1]; 
         end 
       end
       COSHS: begin
-        if (nl_concatenate && opgrp_out_valid[fpnew_pkg::ADDMUL] && opgrp_outputs[0].tag.last_phase != 1'b1) begin
+        if (nl_concatenate && opgrp_out_valid[fpnew_pkg::ADDMUL] && is_last_uop_q != 1'b1) begin
           operands_fconv[0]                   = opgrp_outputs[0].result;
           operands_fconv[1]                   = '0;
           operands_fconv[2]                   = '0;   
@@ -137,13 +136,11 @@ module spatz_fpu #(
           nl_op_conv                          = fpnew_pkg::F2I;
           nl_rnd_conv                         = fpnew_pkg::RTZ;
           fconv_tag                           =  opgrp_outputs[fpnew_pkg::ADDMUL].tag;
-          out_opgrp_ready[0]                  = opgrp_in_ready[3] ? 'b1 : 'b0; 
-          add_phase_d                         = 1'b1;
+          out_opgrp_ready[0]                  = opgrp_in_ready[3]; 
           
         end 
         if (nl_concatenate && opgrp_out_valid[fpnew_pkg::ADDMUL] && opgrp_outputs[0].tag.last_phase != 1'b0) begin
-          out_opgrp_ready[0]                  = 1'b1;
-          is_last_uop                         = 1'b1;
+          is_last_uop_d                       = 1'b1;
         end
       
         if (nl_concatenate && opgrp_out_valid[fpnew_pkg::CONV] && opgrp_outputs[3].tag.nl_phase == NL_FPU_ISSUE_1) begin
@@ -154,14 +151,14 @@ module spatz_fpu #(
           nl_op_add                           = fpnew_pkg::ADD;
           nl_rnd_add                          = fpnew_pkg::RNE;
           fadd_tag                            = opgrp_outputs[fpnew_pkg::CONV].tag;
-          out_opgrp_ready[3]                  = opgrp_in_ready[0] ? 'b1 : 'b0; 
+          out_opgrp_ready[3]                  = opgrp_in_ready[0]; 
         end
 
         if (nl_concatenate && opgrp_out_valid[fpnew_pkg::CONV] && opgrp_outputs[3].tag.nl_phase== NL_FPU_ISSUE_0) begin
           nl_wr_en = 1'b1;
-          out_opgrp_ready[3]                  = 1'b1; 
-          fadd_tag.last_phase                 = 1'b1;
+          out_opgrp_ready[3]                  = 1'b1;
         end
+        if (tag_o.last_phase) is_last_uop_d     = 1'b0;
       end
     endcase
   end
@@ -222,21 +219,44 @@ module spatz_fpu #(
       end
       end
       COSHS: begin
+          // Default (fallback): pass-through input
+        concatenate_in_valid[opgrp] =
+            in_valid_i &&
+            (fpnew_pkg::get_opgroup(op_i) == fpnew_pkg::opgroup_e'(opgrp));
+
+        rnd_mode_in     = rnd_mode_i;
+        op_in           = op_i;
+        opmode_in       = op_mod_i;
+        operands_input  = operands_i;
+        opgrp_tag_in    = tag_i;
+
         if (nl_concatenate) begin
-        concatenate_in_valid[opgrp] = (in_valid_i & (fpnew_pkg::get_opgroup(op_i) == fpnew_pkg::opgroup_e'(opgrp))) || (opgrp_out_valid[0] && (opgrp == 3)) || (opgrp_out_valid[3] && (opgrp == 0));
-        rnd_mode_in     = (opgrp == 3) ?  nl_rnd_conv    : ((opgrp_out_valid[3] && (opgrp == 0))) ? nl_rnd_add   : rnd_mode_i;
-        op_in           = (opgrp == 3) ?  nl_op_conv     : ((opgrp_out_valid[3] && (opgrp == 0))) ? nl_op_add    : op_i;
-        opmode_in       = (opgrp == 3) ?  nl_opmode_conv : ((opgrp_out_valid[3] && (opgrp == 0))) ? nl_opmode_add: op_mod_i;
-        operands_input  = (opgrp == 3) ?  operands_fconv : ((opgrp_out_valid[3] && (opgrp == 0))) ? operands_add : operands_i;
-        opgrp_tag_in    = (opgrp == 3) ?  fconv_tag      : ((opgrp_out_valid[3] && (opgrp == 0))) ? fadd_tag     : tag_i;
-      end else begin
+          if (opgrp_out_valid[fpnew_pkg::ADDMUL] && (opgrp == 3) && is_last_uop_q != 1'b1) begin
+            concatenate_in_valid[opgrp] = 1'b1;
+            rnd_mode_in     = nl_rnd_conv;
+            op_in           = nl_op_conv;
+            opmode_in       = nl_opmode_conv;
+            operands_input  = operands_fconv;
+            opgrp_tag_in    = fconv_tag;
+
+          end else if (opgrp_out_valid[fpnew_pkg::CONV] && (opgrp == 0) && opgrp_outputs[3].tag.nl_phase == NL_FPU_ISSUE_1) begin
+            concatenate_in_valid[opgrp] = 1'b1;
+            rnd_mode_in     = nl_rnd_add;
+            op_in           = nl_op_add;
+            opmode_in       = nl_opmode_add;
+            operands_input  = operands_add;
+            opgrp_tag_in    = fadd_tag;
+          end
+        end
+      end
+
+      default: begin
         concatenate_in_valid[opgrp] = in_valid_i & (fpnew_pkg::get_opgroup(op_i) == fpnew_pkg::opgroup_e'(opgrp));
         rnd_mode_in     = rnd_mode_i;
         op_in           = op_i;
         opmode_in       = op_mod_i;
         operands_input  = operands_i;
         opgrp_tag_in    = tag_i;
-      end
       end
     endcase
       
@@ -292,7 +312,7 @@ module spatz_fpu #(
         unique case(tag_i.nl_op_sel)
           EXPS: concatenate_out_valid[opgrp] = opgrp_out_valid[opgrp] & (opgrp == 3);
           COSHS:begin 
-            if (is_last_uop) concatenate_out_valid[opgrp] = opgrp_out_valid[opgrp] & (opgrp == 0) ; else concatenate_out_valid[opgrp] = '0;
+            if (is_last_uop_q) concatenate_out_valid[opgrp] = opgrp_out_valid[opgrp] & (opgrp == 0) ; else concatenate_out_valid[opgrp] = '0;
           end
         endcase
       end else begin
