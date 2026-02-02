@@ -35,12 +35,14 @@
 #endif
 
 #ifndef NR_ITERS
-#define NR_ITERS   3         /* Newton refinements (2 or 3) */
+#define NR_ITERS 0         /* Newton refinements (2 or 3) */
 #endif
 
 /* Classic Quake magic; try 0x5F375A86u for a slightly different bias. */
 #ifndef RSQRT_MAGIC
 #define RSQRT_MAGIC 0x5F3759DFu
+#define HALF        0.5f
+#define ONE_POINT_FIVE 1.5f
 #endif
 
 #ifndef THRESHOLD
@@ -78,6 +80,19 @@ static inline void vrsqrt_m8_strip(const float* inp, float* out, int N) {
         asm volatile("vsrl.vi   v16, v24, 1");                        /* v16 = xi>>1 (int) */
         asm volatile("vmv.v.x   v24, %0" :: "r"(RSQRT_MAGIC));        /* v24 = MAGIC (int) */
         asm volatile("vsub.vv   v16, v24, v16");                      /* v16 = MAGIC - (xi>>1) */
+        
+
+        /* 2. THE NEWTON RAPHSON STEP */
+        asm volatile("vfmul.vv  v24, v16, v16");                      /* v24 = y * y */
+        asm volatile("vfmul.vv  v24, v24, v8");                       /* v24 = (y * y) * x */
+
+        /* The Magic Instruction: vfnmsac (Fused Negative Multiply-Accumulate)
+        Operation: vd = -(f[rs1] * vs2) + vd 
+        We want:   v24 = -(0.5 * v24) + 1.5
+        */
+        asm volatile("vfmv.v.f  v20, %[c1]":: [c1]"f"(ONE_POINT_FIVE));                        /* Splat 1.5 into v20 */
+        asm volatile("vfnmsac.vf v20, %[c05], v24" :: [c05]"f"(HALF));                  /* v20 = -(0.5 * v24) + 1.5 */
+        asm volatile("vfmul.vv  v16, v16, v20");                      /* y = y * v20 */
 
         /* Newton refinements */
 #if (NR_ITERS >= 1)
@@ -110,7 +125,109 @@ static inline void vrsqrt_m8_strip(const float* inp, float* out, int N) {
         remaining -= (int)vl;
     }
 }
+#include <stdint.h>
 
+#ifndef RSQRT_MAGIC
+#define RSQRT_MAGIC 0x5f375a86u
+#define HALF           0.5f
+#define ONE_POINT_FIVE 1.5f
+#endif
+
+/**
+ * RISC-V Vector Optimized Fast Inverse Square Root
+ * Processes N elements using the Quake-style bit-hack + 1 Newton-Raphson iteration.
+ */
+void vrsqrt_sw(const float* inp, float* out, int N) {
+    const float *pin  = inp;
+    float       *pout = out;
+    int remaining = N;
+
+    while (remaining > 0) {
+        unsigned long vl;
+        
+        // 1. Set configuration: 32-bit elements, LMUL=8
+        // This treats registers in groups of 8 (v8-v15, v16-v23, etc.)
+        asm volatile("vsetvli %0, %1, e32, m8, ta, ma"
+                     : "=r"(vl) : "r"(remaining) : "memory");
+
+        // 2. Load input 'x' into v8 (effectively v8-v15)
+        asm volatile("vle32.v v8, (%0)" :: "r"(pin) : "memory");
+
+        // --- SEED PHASE ---
+        // Treat bits as integers: y = MAGIC - (x >> 1)
+        asm volatile("vsrl.vi   v16, v8, 1");          // v16 = x >> 1
+        asm volatile("li        t0, %0" :: "i"(RSQRT_MAGIC));
+        asm volatile("vrsub.vx  v16, v16, t0");        // v16 = MAGIC - (x >> 1)
+
+        // --- NEWTON-RAPHSON PHASE ---
+        // Formula: y = y * (1.5 - (0.5 * x * y * y))
+        
+        // v24 = x * y^2
+        asm volatile("vfmul.vv   v24, v16, v16");      // v24 = y * y
+        asm volatile("vfmul.vv   v24, v24, v8");       // v24 = (y * y) * x
+
+        // v0 = 1.5 - (0.5 * v24)
+        asm volatile("vfmv.v.f   v0, %[c1]" :: [c1]"f"(ONE_POINT_FIVE)); 
+        // vfnmsac: vd = -(f[rs1] * vs2) + vd
+        asm volatile("vfnmsac.vf v0, %[c05], v24" :: [c05]"f"(HALF));
+
+        // Final y = y * v0
+        asm volatile("vfmul.vv   v16, v16, v0");
+
+        // 3. Store the result 'y'
+        asm volatile("vse32.v v16, (%0)" :: "r"(pout) : "memory");
+
+        // 4. Update pointers and loop counter
+        pin       += vl;
+        pout      += vl;
+        remaining -= (int)vl;
+    }
+}
+void vrsqrt_optimized(const float* inp, float* out,  int N) {
+    const float *pin = inp;
+    float *pout = out;
+    int remaining = N;
+    // N = 2048
+    
+    unsigned long vl;
+    // Configure VTYPE for max length (16 elements per group)
+
+
+    // Loop 32 times to process 2048 elements
+   while (remaining > 0) {
+        unsigned long vl;
+        asm volatile("vsetvli %0, %1, e32, m1, ta, ma"
+                     : "=r"(vl) : "r"(remaining) : "memory");
+        // --- STEP 1: LOAD PHASE (Fill the Register File) ---
+        asm volatile("vle32.v v0,  (%0)" :: "r"(pin)         : "memory");
+        asm volatile("vle32.v v8,  (%0)" :: "r"(pin + vl)    : "memory");
+        asm volatile("vle32.v v16, (%0)" :: "r"(pin + vl*2)  : "memory");
+        asm volatile("vle32.v v24, (%0)" :: "r"(pin + vl*3)  : "memory");
+
+        // Memory Barrier (
+        asm volatile("" ::: "memory"); 
+
+        // --- STEP 2: EXECUTION PHASE (Clean Burst) ---
+        // Operands in v0-v31 are fully resident in VRF.
+        // There are NO dependencies between these instructions.
+        // In the waveform, you will see these issue back-to-back.
+        asm volatile("vfrsqrt.v v0,  v0");
+        asm volatile("vfrsqrt.v v8,  v8");
+        asm volatile("vfrsqrt.v v16,  v16");
+        asm volatile("vfrsqrt.v v24,  v24");
+
+        // --- STEP 3: STORE PHASE (Drain) ---
+        asm volatile("vse32.v v0,  (%0)" :: "r"(pout)        : "memory");
+        asm volatile("vse32.v v8,  (%0)" :: "r"(pout + vl)   : "memory");
+        asm volatile("vse32.v v16, (%0)" :: "r"(pout + vl*2) : "memory");
+        asm volatile("vse32.v v24, (%0)" :: "r"(pout + vl*3) : "memory");
+
+        // Move pointers for the next batch of 512
+        pin  += (vl * 4);
+        pout += (vl * 4);
+        remaining -= (int)(vl * 4);
+    }
+}
 /* ========================= LMUL = 4 (baseline) ========================= */
 static inline void vrsqrt_m4_strip(const float* inp, float* out, int N) {
     const float *pin  = inp;
@@ -277,7 +394,7 @@ int main(void) {
     snrt_cluster_hw_barrier();
 
     if (count > 0) {
-        vrsqrt_strip(g_in + start, g_out + start, count);
+        vrsqrt_sw(g_in + start, g_out + start, count);
     }
 
     snrt_cluster_hw_barrier();

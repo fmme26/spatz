@@ -49,7 +49,7 @@
 #endif
 
 #ifndef TANH_DEG
-#define TANH_DEG 3
+#define TANH_DEG 0
 #endif
 
 #define THRESHOLD 0.00010f
@@ -173,6 +173,81 @@ static inline void vtanh_m8_strip(const float* inp, float* out, int N) {
         remaining -= (int)vl;
     }
 }
+
+
+// Coefficients for y = x * (C + x^2 * (B + x^2 * A))
+#define COEFF_A  0.02655122f
+#define COEFF_B -0.22830456f
+#define COEFF_C  0.97858769f
+#define LIMIT    2.0f
+
+#include <stddef.h>
+
+
+#include <stddef.h>
+
+// Assuming defines or passed in constants
+// #define COEFF_A ...
+// #define COEFF_B ...
+// #define COEFF_C ...
+
+static inline void vtanh_approx_poly_clamped(const float* inp, float* out, int N) {
+    const float *pin  = inp;
+    float       *pout = out;
+    int remaining = N;
+    size_t vl;
+
+    const float a = COEFF_A;
+    const float b = COEFF_B;
+    const float c = COEFF_C;
+    const float upper_bound = 1.0f;
+    const float lower_bound = -1.0f;
+
+    // Use a single loop with one asm block for safety and efficiency
+    for (; remaining > 0; remaining -= (int)vl, pin += vl, pout += vl) {
+
+        // 1. Calculate Vector Length
+        asm volatile("vsetvli %0, %1, e32, m2, ta, mu"
+                     : "=r"(vl) 
+                     : "r"(remaining));
+
+
+        asm volatile(
+            "vle32.v v0, (%[pin])          \n\t" // Load X
+            
+            // Polynomial: x * (c + x^2 * (b + a * x^2))
+            "vfmul.vv v8, v0, v0           \n\t" // v8 = x^2
+            
+            "vfmv.v.f v16, %[b]            \n\t" // v16 = b
+            "vfmacc.vf v16, %[a], v8       \n\t" // v16 = b + (a * x^2)
+            
+            "vfmv.v.f v24, %[c]            \n\t" // v24 = c
+            "vfmacc.vv v24, v16, v8        \n\t" // v24 = c + x^2(b + ax^2)
+            "vfmul.vv v24, v24, v0         \n\t" // v24 = x(...) -> Result
+
+            // Clamping 
+            "vfmin.vf v24, v24, %[max_val] \n\t" // Clamp upper > 1.0
+            "vfmax.vf v24, v24, %[min_val] \n\t" // Clamp lower < -1.0
+
+            "vse32.v v24, (%[pout])        \n\t" // Store result
+            
+            : // No outputs (memory is updated via pointers)
+            : [pin] "r"(pin), 
+              [pout] "r"(pout), 
+              [a] "f"(a), 
+              [b] "f"(b), 
+              [c] "f"(c),
+              [max_val] "f"(upper_bound),
+              [min_val] "f"(lower_bound)
+            : "v0", "v8", "v16", "v24", "memory" // Clobber list
+        );
+    }
+}
+
+
+// Assumes COEFF_A, COEFF_B, COEFF_C are defined
+// Assumes N = 2048 (Fixed)
+
 
 /* ========================= LMUL = 4 ========================= */
 static inline void vtanh_m4_strip(const float* inp, float* out, int N) {
@@ -322,6 +397,48 @@ static inline void vtanh_m2_strip(const float* inp, float* out, int N) {
     }
 }
 
+void vtanh_optimized(const float* inp, float* out,  int N) {
+    const float *pin = inp;
+    float *pout = out;
+    
+    // N = 2048
+    
+    unsigned long vl;
+    // Configure VTYPE for max length (16 elements per group)
+    asm volatile("vsetvli %0, zero, e32, m1, ta, ma" : "=r"(vl)); 
+
+    // Loop 32 times to process 2048 elements
+    for (int i = 0; i < 4; i++) {
+        
+        // --- STEP 1: LOAD PHASE (Fill the Register File) ---
+        asm volatile("vle32.v v0,  (%0)" :: "r"(pin)         : "memory");
+        asm volatile("vle32.v v8,  (%0)" :: "r"(pin + vl)    : "memory");
+        asm volatile("vle32.v v16, (%0)" :: "r"(pin + vl*2)  : "memory");
+        asm volatile("vle32.v v24, (%0)" :: "r"(pin + vl*3)  : "memory");
+
+        // Memory Barrier (
+        asm volatile("" ::: "memory"); 
+
+        // --- STEP 2: EXECUTION PHASE (Clean Burst) ---
+        // Operands in v0-v31 are fully resident in VRF.
+        // There are NO dependencies between these instructions.
+        // In the waveform, you will see these issue back-to-back.
+        asm volatile("vftanhf.v v0,  v0");
+        asm volatile("vftanhf.v v8,  v8");
+        asm volatile("vftanhf.v v16,  v16");
+        asm volatile("vftanhf.v v24,  v24");
+
+        // --- STEP 3: STORE PHASE (Drain) ---
+        asm volatile("vse32.v v0,  (%0)" :: "r"(pout)        : "memory");
+        asm volatile("vse32.v v8,  (%0)" :: "r"(pout + vl)   : "memory");
+        asm volatile("vse32.v v16, (%0)" :: "r"(pout + vl*2) : "memory");
+        asm volatile("vse32.v v24, (%0)" :: "r"(pout + vl*3) : "memory");
+
+        // Move pointers for the next batch of 512
+        pin  += (vl * 4);
+        pout += (vl * 4);
+    }
+}
 /* ------------------- Kernel selector ------------------- */
 static inline void vtanh_strip(const float* inp, float* out, int N) {
 #if   (LMUL_MODE == 8)
@@ -379,7 +496,7 @@ int main(void) {
         start_kernel();
         unsigned t0 = benchmark_get_cycle();
 
-        vtanh_strip(g_in + start, g_out + start, count);
+        vtanh_approx_poly_clamped(g_in + start, g_out + start, count);
 
         unsigned cycles = benchmark_get_cycle() - t0;
         stop_kernel();

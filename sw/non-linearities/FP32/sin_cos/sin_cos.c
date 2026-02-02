@@ -88,6 +88,27 @@ static inline void vcos_f32_m8_strip(const float* inp, float* outc, int N) {
 
         /* x -> v0 */
         asm volatile("vle32.v v0, (%0)" :: "r"(pin) : "memory");
+        
+        // --- Corrected Range Reduction ---
+        asm volatile("vfmul.vf v2, v4, %0" :: "f"(INVPIO2));
+        // Use 'round to nearest' explicitly for quadrant selection
+        asm volatile("vfcvt.x.f.v v22, v2"); 
+        asm volatile("vfcvt.f.x.v v2, v22"); 
+        
+        // r = x - kf*pi/2 (Two-step for precision)
+        asm volatile("vfnmsac.vf v4, %0, v2" :: "f"(PIO2_HI));
+        
+        asm volatile("vfmul.vv v6, v4, v4"); // z = r*r
+
+        // --- Optimized Polynomials ---
+        asm volatile("vfmv.v.f v8, %0" :: "f"(1.0f));
+        asm volatile("vfmacc.vf v8, %0, v6" :: "f"(C2));  // Cos = 1 + C2*z
+
+        asm volatile("vfmv.v.f v10, %0" :: "f"(1.0f));
+        asm volatile("vfmacc.vf v10, %0, v6" :: "f"(S3)); 
+        asm volatile("vfmul.vv v10, v10, v4");           // Sin = r * (1 + S3*z)
+
+
 
         /* y = x*(2/pi) -> v24 ; k=int_rne(y) -> v16 ; kf -> v24 */
         asm volatile("vfmul.vf        v24, v0,  %[A]"  :: [A] "f"(INVPIO2));
@@ -96,7 +117,6 @@ static inline void vcos_f32_m8_strip(const float* inp, float* outc, int N) {
 
         /* r = x - kf*PIO2_HI - kf*PIO2_LO -> v0 ; z = r^2 -> v8 */
         asm volatile("vfnmsac.vf      v0,  %[HI], v24" :: [HI]"f"(PIO2_HI));
-        asm volatile("vfnmsac.vf      v0,  %[LO], v24" :: [LO]"f"(PIO2_LO));
         asm volatile("vfmul.vv        v8,  v0,  v0");             /* z = r^2      */
 
         /* s0 = r*(S1 + z*(S3 + z*(S5 + z*S7))) — keep in v0 */
@@ -144,6 +164,267 @@ static inline void vcos_f32_m8_strip(const float* inp, float* outc, int N) {
         pout += vl;
         remaining -= (int)vl;
     }
+}
+
+
+static inline void vcos_f32_sw(const float* inp, float* outc, int N) {
+    const float C2 = -0.49670f; 
+    const float S3 = -0.16605f; 
+    const float INVPIO2 = 0.63661977f;
+    const float PIO2 = 1.57079632679489661923f;  // Single high-precision constant
+    
+    const float *pin = inp;
+    float *pout = outc;
+    int remaining = N;
+    
+    while (remaining > 0) {
+        unsigned long vl;
+        asm volatile("vsetvli %0, %1, e32, m4, ta, ma"
+                     : "=r"(vl) : "r"(remaining) : "memory");
+        
+        /* Load x -> v0-v3 */
+        asm volatile("vle32.v v0, (%0)" :: "r"(pin) : "memory");
+        
+        // --- Range Reduction (single constant) ---
+        // k = round(x * INVPIO2)
+        asm volatile("vfmul.vf v8, v0, %0" :: "f"(INVPIO2));   // v8-v11
+        asm volatile("vfcvt.x.f.v v16, v8");  // k (integer quadrant) v16-v19
+        asm volatile("vfcvt.f.x.v v8, v16");  // kf (float) v8-v11
+        
+        // r = x - kf*PIO2 (single FMA operation)
+        asm volatile("vmv.v.v v24, v0");           // Copy x to v24-v27
+        asm volatile("vfnmsac.vf v24, %0, v8" :: "f"(PIO2));  // v24 = x - kf*PIO2 = r
+        
+        // z = r*r
+        asm volatile("vfmul.vv v0, v24, v24");  // v0-v3 = z
+        
+        // --- Polynomial Approximations ---
+        // Cosine: c0 = 1 + C2*z
+        asm volatile("vfmv.v.f v4, %0" :: "f"(1.0f));  // v4-v7
+        asm volatile("vfmacc.vf v4, %0, v0" :: "f"(C2));
+        
+        // Sine: s0 = r * (1 + S3*z)
+        asm volatile("vfmv.v.f v12, %0" :: "f"(1.0f));  // v12-v15
+        asm volatile("vfmacc.vf v12, %0, v0" :: "f"(S3));
+        asm volatile("vfmul.vv v12, v12, v24");  // v12 = s0
+        
+        // --- Quadrant Selection ---
+        // q = k & 3
+        asm volatile("vand.vi v8, v16, 3");    // v8-v11 = q
+        
+        // b0 = q & 1
+        asm volatile("vand.vi v20, v8, 1");     // v20-v23 = b0
+        
+        // b1 = (q >> 1) & 1
+        asm volatile("vsrl.vi v28, v8, 1");     // v28-v31
+        asm volatile("vand.vi v28, v28, 1");   // v28 = b1
+        
+        // sign_c = 1 - 2*(b0 ^ b1)
+        asm volatile("vxor.vv v0, v20, v28");   // reuse v0-v3
+        asm volatile("vadd.vv v0, v0, v0");     // v0 = 2*(b0^b1)
+        asm volatile("vrsub.vi v0, v0, 1");     // v0 = 1 - 2*(b0^b1)
+        asm volatile("vfcvt.f.x.v v0, v0");     // Convert to float
+        
+        // Convert b0 to float
+        asm volatile("vfcvt.f.x.v v20, v20");
+        
+        // cos_out = c0 + b0*(s0 - c0)
+        asm volatile("vfsub.vv v8, v12, v4");   // v8 = s0 - c0 (reuse v8-v11)
+        asm volatile("vfmacc.vv v4, v8, v20");  // v4 = c0 + b0*(s0 - c0)
+        
+        // Apply sign
+        asm volatile("vfmul.vv v4, v4, v0");
+        
+        /* Store result */
+        asm volatile("vse32.v v4, (%0)" :: "r"(pout) : "memory");
+        
+        pin  += vl;
+        pout += vl;
+        remaining -= (int)vl;
+    }
+}
+
+static inline void vcos_f32_m8_sw(const float* inp, float* outc, int N) {
+    const float C2 = -0.49670f; 
+    const float S3 = -0.16605f; 
+    const float INVPIO2 = 0.63661977f;
+    const float PIO2 = 1.57079632679489661923f;  // Single high-precision constant
+    
+    const float *pin = inp;
+    float *pout = outc;
+    int remaining = N;
+    
+    while (remaining > 0) {
+        unsigned long vl;
+        asm volatile("vsetvli %0, %1, e32, m8, ta, ma"
+                     : "=r"(vl) : "r"(remaining) : "memory");
+        
+        /* Load x -> v0-v7 */
+        asm volatile("vle32.v v0, (%0)" :: "r"(pin) : "memory");
+        
+        // --- Range Reduction (single constant) ---
+        // k = round(x * INVPIO2)
+        asm volatile("vfmul.vf v8, v0, %0" :: "f"(INVPIO2));   // v8-v15
+        asm volatile("vfcvt.x.f.v v16, v8");  // k (integer quadrant) v16-v23
+        asm volatile("vfcvt.f.x.v v8, v16");  // kf (float) v8-v15
+        
+        // r = x - kf*PIO2 (single FMA operation)
+        asm volatile("vmv.v.v v24, v0");           // Copy x to v24-v31
+        asm volatile("vfnmsac.vf v24, %0, v8" :: "f"(PIO2));  // v24 = x - kf*PIO2 = r
+        
+        // z = r*r
+        asm volatile("vfmul.vv v0, v24, v24");  // v0-v7 = z
+        
+        // --- Polynomial Approximations ---
+        // Cosine: c0 = 1 + C2*z
+        asm volatile("vfmv.v.f v8, %0" :: "f"(1.0f));  // v8-v15 (reuse)
+        asm volatile("vfmacc.vf v8, %0, v0" :: "f"(C2));  // v8 = c0
+        
+        // Sine: s0 = r * (1 + S3*z)
+        asm volatile("vfmv.v.f v0, %0" :: "f"(1.0f));  // v0-v7 (reuse)
+        asm volatile("vfmacc.vf v0, %0, v0" :: "f"(S3));  // WAIT - need z!
+        
+        // Need to recalculate z since we're reusing v0
+        asm volatile("vfmul.vv v0, v24, v24");  // v0-v7 = z (recalculated)
+        
+        // Now compute sine polynomial
+        asm volatile("vfmv.v.f v16, %0" :: "f"(1.0f));  // v16-v23 (reuse after k)
+        asm volatile("vfmacc.vf v16, %0, v0" :: "f"(S3));
+        asm volatile("vfmul.vv v16, v16, v24");  // v16 = s0
+        
+        // --- Quadrant Selection ---
+        // Need to recalculate k since v16 was reused
+        asm volatile("vle32.v v0, (%0)" :: "r"(pin) : "memory");  // Reload x to v0-v7
+        asm volatile("vfmul.vf v0, v0, %0" :: "f"(INVPIO2));   // v0-v7
+        asm volatile("vfcvt.x.f.v v24, v0");  // k (integer) v24-v31 (reuse)
+        
+        // q = k & 3
+        asm volatile("vand.vi v0, v24, 3");    // v0-v7 = q (reuse)
+        
+        // b0 = q & 1
+        asm volatile("vand.vi v24, v0, 1");     // v24-v31 = b0 (reuse)
+        
+        // b1 = (q >> 1) & 1
+        asm volatile("vsrl.vi v0, v0, 1");     // v0-v7 (reuse)
+        asm volatile("vand.vi v0, v0, 1");     // v0 = b1
+        
+        // sign_c = 1 - 2*(b0 ^ b1)
+        asm volatile("vxor.vv v0, v24, v0");   // v0-v7 (reuse)
+        asm volatile("vadd.vv v0, v0, v0");    // v0 = 2*(b0^b1)
+        asm volatile("vrsub.vi v0, v0, 1");    // v0 = 1 - 2*(b0^b1)
+        asm volatile("vfcvt.f.x.v v0, v0");    // Convert to float
+        
+        // Convert b0 to float
+        asm volatile("vfcvt.f.x.v v24, v24");  // v24 = b0 (float)
+        
+        // cos_out = c0 + b0*(s0 - c0)
+        asm volatile("vfsub.vv v16, v16, v8");   // v16 = s0 - c0 (reuse v16)
+        asm volatile("vfmacc.vv v8, v16, v24");  // v8 = c0 + b0*(s0 - c0)
+        
+        // Apply sign
+        asm volatile("vfmul.vv v8, v8, v0");
+        
+        /* Store result */
+        asm volatile("vse32.v v8, (%0)" :: "r"(pout) : "memory");
+        
+        pin  += vl;
+        pout += vl;
+        remaining -= (int)vl;
+    }
+}
+
+static inline void fast_sincos_cheapest_corrected_f32_m2(const float* inp, float* outs, float* outc, int N) {
+    const float C2 = -0.49670f; 
+    const float S3 = -0.16605f; 
+    const float INVPIO2 = 0.63661977f;
+    const float PIO2_HI = 1.57079632f;
+    const float PIO2_LO = 6.12323399e-17f; // Essential for phase stability
+
+    while (N > 0) {
+        size_t vl;
+        asm volatile("vsetvli %0, %1, e32, m2, ta, ma" : "=r"(vl) : "r"(N));
+
+        asm volatile("vle32.v v4, (%0)" :: "r"(inp));
+        
+        // --- Corrected Range Reduction ---
+        asm volatile("vfmul.vf v2, v4, %0" :: "f"(INVPIO2));
+        // Use 'round to nearest' explicitly for quadrant selection
+        asm volatile("vfcvt.x.f.v v22, v2"); 
+        asm volatile("vfcvt.f.x.v v2, v22"); 
+        
+        // r = x - kf*pi/2 (Two-step for precision)
+        asm volatile("vfnmsac.vf v4, %0, v2" :: "f"(PIO2_HI));
+        asm volatile("vfnmsac.vf v4, %0, v2" :: "f"(PIO2_LO)); 
+        
+        asm volatile("vfmul.vv v6, v4, v4"); // z = r*r
+
+        // --- Optimized Polynomials ---
+        asm volatile("vfmv.v.f v8, %0" :: "f"(1.0f));
+        asm volatile("vfmacc.vf v8, %0, v6" :: "f"(C2));  // Cos = 1 + C2*z
+
+        asm volatile("vfmv.v.f v10, %0" :: "f"(1.0f));
+        asm volatile("vfmacc.vf v10, %0, v6" :: "f"(S3)); 
+        asm volatile("vfmul.vv v10, v10, v4");           // Sin = r * (1 + S3*z)
+
+        // --- Sign & Swap ---
+        asm volatile("vand.vi v24, v22, 1");  // bit0
+        asm volatile("vmsne.vi v0, v24, 0"); 
+        asm volatile("vmerge.vvm v12, v8, v10, v0"); // Cos Mag
+        asm volatile("vmerge.vvm v14, v10, v8, v0"); // Sin Mag
+
+        // Signs using XOR logic
+        asm volatile("vsrl.vi v26, v22, 1");   // bit1
+        asm volatile("vxor.vv v28, v26, v24"); // bit1 ^ bit0
+        asm volatile("vsll.vi v28, v28, 31");
+        asm volatile("vsll.vi v26, v26, 31");
+        asm volatile("vfsgnjx.vv v12, v12, v28"); // Apply to Cos
+        asm volatile("vfsgnjx.vv v14, v14, v26"); // Apply to Sin
+
+        asm volatile("vse32.v v14, (%0)" :: "r"(outs));
+        asm volatile("vse32.v v12, (%0)" :: "r"(outc));
+
+        inp += vl; outs += vl; outc += vl; N -= vl;
+    }
+}
+
+
+static inline void vfcos_hw_test(const float* inp, float* out, int N) {
+  const float *pin  = inp;
+  float       *pout = out;
+
+  unsigned long vl;
+  // Fixed VTYPE: e32, m4
+  asm volatile("vsetvli %0, zero, e32, m1, ta, ma" : "=r"(vl) :: "memory");
+
+  // 4 vector-groups per iteration => 4*vl elements/iter
+  const int iters = N / (int)(4ul * vl);
+
+  for (int i = 0; i < iters; i++) {
+    // --- STEP 1: LOAD PHASE ---
+    // group-aligned bases for m4: 0,4,8,12
+    asm volatile("vle32.v v0,  (%0)" :: "r"(pin)            : "memory");
+    asm volatile("vle32.v v8,  (%0)" :: "r"(pin +      vl)  : "memory");
+    asm volatile("vle32.v v16,  (%0)" :: "r"(pin + 2ul*vl)   : "memory");
+    asm volatile("vle32.v v24, (%0)" :: "r"(pin + 3ul*vl)   : "memory");
+
+    asm volatile("" ::: "memory");
+
+    // --- STEP 2: EXECUTION PHASE (Clean Burst) ---
+    // outputs also group-aligned: 16,20,24,28
+    asm volatile("vfsin.v v0, v0");
+    asm volatile("vfsin.v v8, v8");
+    asm volatile("vfsin.v v16, v16");
+    asm volatile("vfsin.v v24, v24");
+
+    // --- STEP 3: STORE PHASE ---
+    asm volatile("vse32.v v0, (%0)" :: "r"(pout)            : "memory");
+    asm volatile("vse32.v v8, (%0)" :: "r"(pout +      vl)  : "memory");
+    asm volatile("vse32.v v16, (%0)" :: "r"(pout + 2ul*vl)   : "memory");
+    asm volatile("vse32.v v24, (%0)" :: "r"(pout + 3ul*vl)   : "memory");
+
+    pin  += 4ul * vl;
+    pout += 4ul * vl;
+  }
 }
 /* Fast single-output cosf with RVV (SEW=32, LMUL=4), strip-mined & maskless.
    Requires FRM = RNE so vfcvt.x.f.v does round-to-nearest-even for k. */
@@ -527,7 +808,7 @@ int main() {
     //                                len);
     // }
     if (len > 0) {
-        vcos_f32_m4_strip(g_inp  + start,g_outc + start,len);
+        vfcos_hw_test(g_inp  + start,g_outc + start,len);
     }
     // Wait for all cores to finish before stopping the timer and checking.
     snrt_cluster_hw_barrier();
@@ -543,9 +824,9 @@ int main() {
 #endif
         printf("Parallel sincos cycles: %u (cores=%u)\n", cycles, cores);
         printf("CHECK RESULTS (cos)\n");
-        check_result(g_inp,g_outc, outC, N);
+        //check_result(g_inp,g_outc, outC, N);
         // printf("CHECK RESULTS (sin)\n");
-        // check_result(g_inp , g_outs, outS, N);
+        check_result(g_inp , g_outc, outS, N);
         
     }
 

@@ -80,7 +80,7 @@ static inline void vcosh_m8_strip(const float* inp, float* out, int N) {
 
     while (remaining > 0) {
         unsigned long vl;
-        asm volatile("vsetvli %0, %1, e32, m8, ta, ma"
+        asm volatile("vsetvli %0, %1, e32, m1, ta, ma"
                      : "=r"(vl) : "r"(remaining) : "memory");
 
         asm volatile("vle32.v   v24, (%0)" :: "r"(pin) : "memory"); /* x -> v24 */
@@ -250,6 +250,70 @@ static inline void vcosh_m4_strip(const float* inp, float* out, int N) {
         pin  += vl;
         pout += vl;
         remaining -= (int)vl;
+    }
+}
+static inline void vcosh_m1_strip_burst_4(const float* inp, float* out, int N) {
+    const float *pin  = inp;
+    float       *pout = out;
+    int remaining = N;
+
+    while (remaining > 0) {
+        unsigned long vl;
+
+        asm volatile("vsetvli %0, zero, e32, m1, ta, ma" : "=r"(vl) :: "memory");
+
+
+        /* load 4 vectors */
+        asm volatile("vle32.v   v0, (%0)" :: "r"(pin)           : "memory");
+        asm volatile("vle32.v   v1, (%0)" :: "r"(pin + vl)      : "memory");
+        asm volatile("vle32.v   v2, (%0)" :: "r"(pin + 2*vl)    : "memory");
+        asm volatile("vle32.v   v3, (%0)" :: "r"(pin + 3*vl)    : "memory");
+
+        /* --- group 0: v0 -> v0 --- */
+        asm volatile("vfmul.vf           v4, v0, %[c]"     :: [c]"f"(SCH_C));
+        asm volatile("vfadd.vf           v0, v4, %[b]"     :: [b]"f"(SCH_B));   /* B + xC */
+        asm volatile("vfrsub.vf          v4, v4, %[b]"     :: [b]"f"(SCH_B));   /* B - xC */
+        asm volatile("vfcvt.rtz.xu.f.v   v0, v0");
+        asm volatile("vfcvt.rtz.xu.f.v   v4, v4");
+        asm volatile("vfadd.vv           v0, v0, v4");
+        asm volatile("vfmul.vf           v0, v0, %[half]"  :: [half]"f"(0.5f));
+
+        /* --- group 1: v1 -> v1 --- */
+        asm volatile("vfmul.vf           v5, v1, %[c]"     :: [c]"f"(SCH_C));
+        asm volatile("vfadd.vf           v1, v5, %[b]"     :: [b]"f"(SCH_B));
+        asm volatile("vfrsub.vf          v5, v5, %[b]"     :: [b]"f"(SCH_B));
+        asm volatile("vfcvt.rtz.xu.f.v   v1, v1");
+        asm volatile("vfcvt.rtz.xu.f.v   v5, v5");
+        asm volatile("vfadd.vv           v1, v1, v5");
+        asm volatile("vfmul.vf           v1, v1, %[half]"  :: [half]"f"(0.5f));
+
+        /* --- group 2: v2 -> v2 --- */
+        asm volatile("vfmul.vf           v6, v2, %[c]"     :: [c]"f"(SCH_C));
+        asm volatile("vfadd.vf           v2, v6, %[b]"     :: [b]"f"(SCH_B));
+        asm volatile("vfrsub.vf          v6, v6, %[b]"     :: [b]"f"(SCH_B));
+        asm volatile("vfcvt.rtz.xu.f.v   v2, v2");
+        asm volatile("vfcvt.rtz.xu.f.v   v6, v6");
+        asm volatile("vfadd.vv           v2, v2, v6");
+        asm volatile("vfmul.vf           v2, v2, %[half]"  :: [half]"f"(0.5f));
+
+        /* --- group 3: v3 -> v3 --- */
+        asm volatile("vfmul.vf           v7, v3, %[c]"     :: [c]"f"(SCH_C));
+        asm volatile("vfadd.vf           v3, v7, %[b]"     :: [b]"f"(SCH_B));
+        asm volatile("vfrsub.vf          v7, v7, %[b]"     :: [b]"f"(SCH_B));
+        asm volatile("vfcvt.rtz.xu.f.v   v3, v3");
+        asm volatile("vfcvt.rtz.xu.f.v   v7, v7");
+        asm volatile("vfadd.vv           v3, v3, v7");
+        asm volatile("vfmul.vf           v3, v3, %[half]"  :: [half]"f"(0.5f));
+
+        /* store 4 vectors */
+        asm volatile("vse32.v v0, (%0)" :: "r"(pout)        : "memory");
+        asm volatile("vse32.v v1, (%0)" :: "r"(pout + vl)   : "memory");
+        asm volatile("vse32.v v2, (%0)" :: "r"(pout + 2*vl) : "memory");
+        asm volatile("vse32.v v3, (%0)" :: "r"(pout + 3*vl) : "memory");
+
+        pin       += 4 * (int)vl;
+        pout      += 4 * (int)vl;
+        remaining -= (int)(4 * vl);
     }
 }
 
@@ -424,6 +488,48 @@ void vcosh_optimized(const float* inp, float* out,  int N) {
         pout += (vl * 4);
     }
 }
+
+// LMUL=4 version of your vfcoshf “clean burst” microbenchmark.
+// Key LMUL rule: with m4, each vector operand is a 4-register group, so base regs
+// must be multiples of 4. Use v0,v4,v8,v12 for inputs and v16,v20,v24,v28 for outputs.
+
+static inline void vcosh_optimized_m4(const float* inp, float* out, int N) {
+  const float *pin  = inp;
+  float       *pout = out;
+
+  unsigned long vl;
+  // Configure VTYPE for max length with LMUL=4
+  asm volatile("vsetvli %0, zero, e32, m8, ta, ma" : "=r"(vl) :: "memory");
+
+  // 4 vector-groups per iter => 4*vl elements per iter
+  const int iters = N / (int)(4ul * vl);
+
+  for (int i = 0; i < iters; i++) {
+    // --- STEP 1: LOAD PHASE ---
+    asm volatile("vle32.v v0,  (%0)" :: "r"(pin)            : "memory");
+    asm volatile("vle32.v v8,  (%0)" :: "r"(pin +      vl)  : "memory");
+    asm volatile("vle32.v v16,  (%0)" :: "r"(pin + 2ul*vl)   : "memory");
+    asm volatile("vle32.v v24, (%0)" :: "r"(pin + 3ul*vl)   : "memory");
+
+    asm volatile("" ::: "memory");
+
+    // --- STEP 2: EXECUTION PHASE (Clean Burst) ---
+    asm volatile("vfcoshf.v v0, v0");
+    asm volatile("vfcoshf.v v8, v8");
+    asm volatile("vfcoshf.v v16, v16");
+    asm volatile("vfcoshf.v v24, v24");
+
+    // --- STEP 3: STORE PHASE ---
+    asm volatile("vse32.v v0, (%0)" :: "r"(pout)            : "memory");
+    asm volatile("vse32.v v8, (%0)" :: "r"(pout +      vl)  : "memory");
+    asm volatile("vse32.v v16, (%0)" :: "r"(pout + 2ul*vl)   : "memory");
+    asm volatile("vse32.v v24, (%0)" :: "r"(pout + 3ul*vl)   : "memory");
+
+    pin  += 4ul * vl;
+    pout += 4ul * vl;
+  }
+}
+
 /* ------------------- Kernel selector ------------------- */
 static inline void vcosh_strip(const float* inp, float* out, int N) {
 #if   (LMUL_MODE == 8)
@@ -447,17 +553,10 @@ static void check_result(const float *input, const float *x, const float *ref, i
     int err = 0;
     for (int i = 0; i < r; i++) {
         float diff = fabsf(x[i] - ref[i]);
-        uint32_t in_b  = f32_bits(input[i]);
-        uint32_t ref_b = f32_bits(ref[i]);
-        uint32_t x_b   = f32_bits(x[i]);
-        uint32_t diff_b= f32_bits(diff);
-        printf("i=%d input=% .8e (0x%08" PRIx32 ")  ref=% .8e (0x%08" PRIx32 ")  got=% .8e (0x%08" PRIx32 ")  diff=% .8e (0x%08" PRIx32 ") \n",
-           i,
-           input[i], in_b,
-           ref[i],   ref_b,
-           x[i],     x_b,
-           diff,diff_b);
-}
+        printf("At index %d:\t, value %f\t expected %f\t real %f\t error %f\n",
+                i, input[i], ref[i], x[i], diff);
+        
+    }
 }
 /* ----------------------------- Main ----------------------------- */
 int main(void) {
@@ -491,7 +590,7 @@ int main(void) {
         start_kernel();
         unsigned t0 = benchmark_get_cycle();
 
-        vcosh_m2_strip(g_in + start, g_out + start, count);
+        vcosh_optimized(g_in + start, g_out + start, count);
 
         unsigned cycles = benchmark_get_cycle() - t0;
         stop_kernel();

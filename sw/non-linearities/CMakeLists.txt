@@ -51,5 +51,6 @@ add_snitch_test(rsqrt /usr/scratch2/pisoc1/msc25h16/spatz/sw/non-linearities/FP3
 add_snitch_test(tanh /usr/scratch2/pisoc1/msc25h16/spatz/sw/non-linearities/FP32/tanh/tanh.c)
 add_snitch_test(cosh /usr/scratch2/pisoc1/msc25h16/spatz/sw/non-linearities/FP32/cosh/cosh.c)
 add_snitch_test(exp /usr/scratch2/pisoc1/msc25h16/spatz/sw/non-linearities/FP32/exp/exp.c)
+add_snitch_test(rec /usr/scratch2/pisoc1/msc25h16/spatz/sw/non-linearities/FP32/rec/rec.c)
 
 
