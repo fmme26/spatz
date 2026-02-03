@@ -222,7 +222,7 @@ module spatz_vfu
   logic is_fpu_insn;
   logic is_nl_op;
 
-  assign is_nl_op = (spatz_req.op == VFEXPF || spatz_req.op == VFCOSHF || spatz_req.op == VFTANHF || spatz_req.op == VFLOG || spatz_req.op == VFRSQRT || spatz_req.op == VFCOS || spatz_req.op == VFSIN);
+  assign is_nl_op = (spatz_req.op == VFEXPF || spatz_req.op == VFCOSHF || spatz_req.op == VFTANHF || spatz_req.op == VFLOG || spatz_req.op == VFRSQRT || spatz_req.op == VFCOS || spatz_req.op == VFSIN );
   assign is_fpu_insn = FPU && ((spatz_req.op inside {[VFADD:VSDOTP]}) || is_nl_op);
 
   always_comb begin
