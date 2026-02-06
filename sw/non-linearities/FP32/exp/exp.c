@@ -562,7 +562,7 @@ int main(void) {
         start_kernel();
         unsigned t0 = benchmark_get_cycle();
 
-        vexp_m4_burst4(g_in + start, g_out + start, count);
+        vexp_optimized_m4(g_in + start, g_out + start, count);
 
         unsigned cycles = benchmark_get_cycle() - t0;
         stop_kernel();

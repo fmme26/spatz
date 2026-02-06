@@ -609,7 +609,7 @@ int main(void) {
         start_kernel();
         unsigned t0 = benchmark_get_cycle();
 
-        vlogf_m8_cheapest(g_in + start, g_out + start, count);
+        vlogf_optimized_m4(g_in + start, g_out + start, count);
 
         unsigned cycles = benchmark_get_cycle() - t0;
         stop_kernel();

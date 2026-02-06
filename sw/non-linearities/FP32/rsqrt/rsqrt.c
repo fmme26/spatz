@@ -394,7 +394,7 @@ int main(void) {
     snrt_cluster_hw_barrier();
 
     if (count > 0) {
-        vrsqrt_sw(g_in + start, g_out + start, count);
+        vrsqrt_optimized(g_in + start, g_out + start, count);
     }
 
     snrt_cluster_hw_barrier();

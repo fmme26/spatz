@@ -411,10 +411,10 @@ static inline void vfcos_hw_test(const float* inp, float* out, int N) {
 
     // --- STEP 2: EXECUTION PHASE (Clean Burst) ---
     // outputs also group-aligned: 16,20,24,28
-    asm volatile("vfsin.v v0, v0");
-    asm volatile("vfsin.v v8, v8");
-    asm volatile("vfsin.v v16, v16");
-    asm volatile("vfsin.v v24, v24");
+    asm volatile("vfcos.v v0, v0");
+    asm volatile("vfcos.v v8, v8");
+    asm volatile("vfcos.v v16, v16");
+    asm volatile("vfcos.v v24, v24");
 
     // --- STEP 3: STORE PHASE ---
     asm volatile("vse32.v v0, (%0)" :: "r"(pout)            : "memory");
@@ -826,7 +826,7 @@ int main() {
         printf("CHECK RESULTS (cos)\n");
         //check_result(g_inp,g_outc, outC, N);
         // printf("CHECK RESULTS (sin)\n");
-        check_result(g_inp , g_outc, outS, N);
+        check_result(g_inp , g_outc, outC, N);
         
     }
 

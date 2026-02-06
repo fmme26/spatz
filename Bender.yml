@@ -128,6 +128,7 @@ sources:
     # Level 2
     - hw/ip/spatz/src/spatz_decoder.sv
     - hw/ip/spatz/src/spatz_simd_lane.sv
+    - hw/ip/spatz/src/fpnew_nl_pkg.sv
     - hw/ip/spatz/src/spatz_fpu.sv
     - target: fpga
       files:
